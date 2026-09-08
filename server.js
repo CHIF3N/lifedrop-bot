@@ -39,31 +39,41 @@ app.post('/webhook', async (req, res) => {
 
       console.log(`Message from ${from}: ${text}`);
 
-      // Basic reply for now — we'll build the donor/request logic next
       await sendMessage(from, `Got your message: "${text}". LifeDrop is being built — thanks for your patience!`);
     }
   } catch (err) {
-    console.error('Error handling webhook:', err.message);
+    if (err.response) {
+      console.error('Error handling webhook. Status:', err.response.status);
+      console.error('Error details:', JSON.stringify(err.response.data));
+    } else {
+      console.error('Error handling webhook:', err.message);
+    }
   }
 
   res.sendStatus(200);
 });
 
 async function sendMessage(to, text) {
-  await axios.post(
-    `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`,
-    {
-      messaging_product: 'whatsapp',
-      to: to,
-      text: { body: text }
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-        'Content-Type': 'application/json'
-      }
+  const url = `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`;
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: to,
+    type: 'text',
+    text: { body: text }
+  };
+
+  console.log('Sending message with payload:', JSON.stringify(payload));
+  console.log('Using PHONE_NUMBER_ID:', PHONE_NUMBER_ID);
+
+  const response = await axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      'Content-Type': 'application/json'
     }
-  );
+  });
+
+  console.log('Message sent successfully:', JSON.stringify(response.data));
 }
 
 app.get('/', (req, res) => res.send('LifeDrop bot is running.'));
