@@ -9,13 +9,13 @@ app.use(bodyParser.json());
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const DONOR_FLOW_ID = '2716596505409098'; // your Donor Registration Flow ID
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// In-memory conversation state (resets if server restarts — fine for now)
 const sessions = {};
 
 app.get('/webhook', (req, res) => {
@@ -34,8 +34,15 @@ app.post('/webhook', async (req, res) => {
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (message) {
       const from = message.from;
-      const text = message.text?.body?.trim() || '';
-      await handleMessage(from, text);
+
+      // Handle a completed WhatsApp Flow submission
+      if (message.type === 'interactive' && message.interactive?.type === 'nfm_reply') {
+        const flowResponse = JSON.parse(message.interactive.nfm_reply.response_json);
+        await handleFlowSubmission(from, flowResponse);
+      } else {
+        const text = message.text?.body?.trim() || '';
+        await handleMessage(from, text);
+      }
     }
   } catch (err) {
     console.error('Error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
@@ -49,7 +56,6 @@ async function handleMessage(from, text) {
   }
   const session = sessions[from];
 
-  // Allow restart anytime
   if (text.toLowerCase() === 'restart') {
     sessions[from] = { step: 'start', data: {} };
     return sendMessage(from, "Restarted. Welcome to LifeDrop! Reply:\n1 - Register as a blood donor\n2 - Request blood");
@@ -62,8 +68,8 @@ async function handleMessage(from, text) {
 
     case 'menu':
       if (text === '1') {
-        session.step = 'donor_name';
-        return sendMessage(from, "Great! Let's get you registered. What's your full name?");
+        sessions[from] = { step: 'start', data: {} }; // reset, Flow handles the rest
+        return sendDonorFlow(from);
       } else if (text === '2') {
         session.step = 'request_blood_type';
         return sendMessage(from, "What blood type is needed? (e.g. A+, O-, B+)");
@@ -71,68 +77,6 @@ async function handleMessage(from, text) {
         return sendMessage(from, "Please reply with 1 (donor) or 2 (request blood).");
       }
 
-    // ---- DONOR REGISTRATION FLOW ----
-    case 'donor_name':
-      session.data.name = text;
-      session.step = 'donor_blood_type';
-      return sendMessage(from, "What's your blood type? (e.g. A+, O-, B+)");
-
-    case 'donor_blood_type':
-      session.data.blood_type = text.toUpperCase();
-      session.step = 'donor_city';
-      return sendMessage(from, "Which city/town are you in?");
-
-    case 'donor_city':
-      session.data.city = text;
-      session.step = 'donor_age';
-      return sendMessage(from, "What's your age?");
-
-    case 'donor_age':
-      session.data.age = parseInt(text) || null;
-      session.step = 'donor_weight';
-      return sendMessage(from, "What's your weight in kg?");
-
-    case 'donor_weight':
-      session.data.weight_kg = parseInt(text) || null;
-      session.step = 'donor_last_donation';
-      return sendMessage(from, "When did you last donate blood? Reply 'never' or a rough date (e.g. Jan 2026).");
-
-    case 'donor_last_donation':
-      session.data.last_donation_text = text;
-      session.step = 'donor_medication';
-      return sendMessage(from, "Are you currently on any medication? (yes/no)");
-
-    case 'donor_medication':
-      session.data.on_medication = text.toLowerCase().startsWith('y');
-      session.step = 'donor_chronic';
-      return sendMessage(from, "Do you have any chronic condition (diabetes, hypertension, HIV, hepatitis)? (yes/no)");
-
-    case 'donor_chronic':
-      session.data.chronic_condition = text.toLowerCase().startsWith('y');
-      session.step = 'donor_illness';
-      return sendMessage(from, "Any fever, cold, or illness in the past 2 weeks? (yes/no)");
-
-    case 'donor_illness':
-      session.data.recent_illness = text.toLowerCase().startsWith('y');
-      session.step = 'donor_tattoo';
-      return sendMessage(from, "Any tattoo or piercing in the last 6 months? (yes/no)");
-
-    case 'donor_tattoo':
-      session.data.recent_tattoo_piercing = text.toLowerCase().startsWith('y');
-      session.step = 'donor_consent';
-      return sendMessage(from, "Last step: do you consent to LifeDrop storing your info to match you with blood requests? (yes/no)");
-
-    case 'donor_consent':
-      session.data.consent_given = text.toLowerCase().startsWith('y');
-      if (!session.data.consent_given) {
-        sessions[from] = { step: 'start', data: {} };
-        return sendMessage(from, "No problem — we won't save your info. Message us anytime if you change your mind.");
-      }
-      await saveDonor(from, session.data);
-      sessions[from] = { step: 'start', data: {} };
-      return sendMessage(from, "Thank you! You're registered as a LifeDrop donor. We'll reach out when there's a matching request nearby. 🩸");
-
-    // ---- BLOOD REQUEST FLOW ----
     case 'request_blood_type':
       session.data.blood_type_needed = text.toUpperCase();
       session.step = 'request_location';
@@ -155,7 +99,18 @@ async function handleMessage(from, text) {
   }
 }
 
+async function handleFlowSubmission(from, flowData) {
+  await saveDonor(from, flowData);
+  await sendMessage(from, "Thank you! You're registered as a LifeDrop donor. We'll reach out when there's a matching request nearby. 🩸");
+}
+
 async function saveDonor(phone, d) {
+  const onMed = d.on_medication === 'yes';
+  const chronic = d.chronic_condition === 'yes';
+  const illness = d.recent_illness === 'yes';
+  const tattoo = d.recent_tattoo_piercing === 'yes';
+  const consent = d.consent && d.consent.includes('agree');
+
   await pool.query(
     `INSERT INTO donors (name, phone, blood_type, city, age, weight_kg, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing, consent_given, eligibility_status)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
@@ -163,9 +118,8 @@ async function saveDonor(phone, d) {
        name=$1, blood_type=$3, city=$4, age=$5, weight_kg=$6, on_medication=$7, chronic_condition=$8, recent_illness=$9, recent_tattoo_piercing=$10, consent_given=$11, eligibility_status=$12`,
     [
       d.name, phone, d.blood_type, d.city, d.age, d.weight_kg,
-      d.on_medication, d.chronic_condition, d.recent_illness, d.recent_tattoo_piercing,
-      d.consent_given,
-      (d.on_medication || d.chronic_condition || d.recent_illness || d.recent_tattoo_piercing) ? 'needs_review' : 'eligible'
+      onMed, chronic, illness, tattoo, consent,
+      (onMed || chronic || illness || tattoo) ? 'needs_review' : 'eligible'
     ]
   );
 }
@@ -183,13 +137,39 @@ async function saveRequestAndMatch(phone, d) {
   );
 
   for (const donor of matches.rows) {
-    await pool.query(
-      `INSERT INTO matches (request_id, donor_id) VALUES ($1, $2)`,
-      [requestId, donor.id]
-    );
+    await pool.query(`INSERT INTO matches (request_id, donor_id) VALUES ($1, $2)`, [requestId, donor.id]);
   }
 
   return matches.rows.length;
+}
+
+async function sendDonorFlow(to) {
+  await axios.post(
+    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'flow',
+        header: { type: 'text', text: 'LifeDrop Donor Registration' },
+        body: { text: "Let's get you registered as a blood donor. Tap below to start." },
+        footer: { text: 'Takes about 2 minutes' },
+        action: {
+          name: 'flow',
+          parameters: {
+            flow_message_version: '3',
+            flow_token: `token_${to}_${Date.now()}`,
+            flow_id: DONOR_FLOW_ID,
+            flow_cta: 'Start Registration',
+            flow_action: 'navigate',
+            flow_action_payload: { screen: 'PERSONAL_INFO' }
+          }
+        }
+      }
+    },
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
 }
 
 async function sendMessage(to, text) {
