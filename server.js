@@ -35,9 +35,17 @@ app.post('/webhook', async (req, res) => {
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (message) {
       const from = message.from;
+
       if (message.type === 'interactive' && message.interactive?.type === 'nfm_reply') {
         const flowResponse = JSON.parse(message.interactive.nfm_reply.response_json);
         await handleFlowSubmission(from, flowResponse);
+      } else if (message.type === 'interactive' && message.interactive?.type === 'button_reply') {
+        const buttonId = message.interactive.button_reply.id;
+        if (buttonId.startsWith('match_')) {
+          await handleDonorResponse(from, buttonId);
+        } else {
+          await handleMessage(from, buttonId);
+        }
       } else {
         const text = message.text?.body?.trim() || '';
         await handleMessage(from, text);
@@ -93,11 +101,27 @@ async function handleMessage(from, text) {
 
     case 'request_hospital':
       session.data.hospital_name = text.toLowerCase() === 'skip' ? null : text;
+      session.step = 'request_units';
+      return sendMessage(from, "How many units are needed? (reply with a number, or 'skip')");
+
+    case 'request_units': {
+      const parsed = parseInt(text, 10);
+      session.data.units_needed = isNaN(parsed) ? null : parsed;
       session.step = 'request_urgency';
-      return sendMessage(from, "How urgent is this? (e.g. immediate, today, this week)");
+      return sendButtons(from, "How urgent is this?", [
+        { id: 'urgency_routine', title: 'Routine' },
+        { id: 'urgency_urgent', title: 'Urgent' },
+        { id: 'urgency_emergency', title: 'Emergency' }
+      ]);
+    }
 
     case 'request_urgency': {
-      session.data.urgency = text;
+      const urgencyMap = {
+        urgency_routine: 'Routine',
+        urgency_urgent: 'Urgent',
+        urgency_emergency: 'Emergency'
+      };
+      session.data.urgency = urgencyMap[text] || text;
       const matchCount = await saveRequestAndMatch(from, session.data);
       sessions[from] = { step: 'start', data: {} };
       return sendMessage(from, `Request logged. Found ${matchCount} potential matching donor(s) in ${session.data.location}. We're reaching out to them now.`);
@@ -150,21 +174,50 @@ async function sendCommunityLinkIfNeeded(phone) {
 
 async function saveRequestAndMatch(phone, d) {
   const result = await pool.query(
-    `INSERT INTO requests (requester_phone, blood_type_needed, location, hospital_name, urgency) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-    [phone, d.blood_type_needed, d.location, d.hospital_name, d.urgency]
+    `INSERT INTO requests (requester_phone, blood_type_needed, location, hospital_name, units_needed, urgency) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [phone, d.blood_type_needed, d.location, d.hospital_name, d.units_needed, d.urgency]
   );
   const requestId = result.rows[0].id;
 
-  const matches = await pool.query(
-    `SELECT id FROM donors WHERE blood_type = $1 AND city ILIKE $2 AND eligibility_status = 'eligible'`,
+  const matchedDonors = await pool.query(
+    `SELECT id, phone FROM donors WHERE blood_type = $1 AND city ILIKE $2 AND eligibility_status = 'eligible'`,
     [d.blood_type_needed, `%${d.location}%`]
   );
 
-  for (const donor of matches.rows) {
-    await pool.query(`INSERT INTO matches (request_id, donor_id) VALUES ($1, $2)`, [requestId, donor.id]);
+  for (const donor of matchedDonors.rows) {
+    const matchResult = await pool.query(
+      `INSERT INTO matches (request_id, donor_id, contacted_at) VALUES ($1, $2, NOW()) RETURNING id`,
+      [requestId, donor.id]
+    );
+    const matchId = matchResult.rows[0].id;
+    await notifyDonor(donor.phone, matchId, d);
   }
 
-  return matches.rows.length;
+  return matchedDonors.rows.length;
+}
+
+async function notifyDonor(donorPhone, matchId, requestData) {
+  const hospitalLine = requestData.hospital_name ? ` at ${requestData.hospital_name}` : '';
+  const unitsLine = requestData.units_needed ? ` (${requestData.units_needed} unit(s) needed)` : '';
+  const body = `🩸 Blood needed: ${requestData.blood_type_needed} in ${requestData.location}${hospitalLine}.\nUrgency: ${requestData.urgency}${unitsLine}\n\nCan you donate?`;
+
+  await sendButtons(donorPhone, body, [
+    { id: `match_yes_${matchId}`, title: 'Yes, I can' },
+    { id: `match_no_${matchId}`, title: 'Not available' }
+  ]);
+}
+
+async function handleDonorResponse(from, buttonId) {
+  const isYes = buttonId.startsWith('match_yes_');
+  const matchId = buttonId.replace('match_yes_', '').replace('match_no_', '');
+
+  await pool.query(`UPDATE matches SET response = $1 WHERE id = $2`, [isYes ? 'yes' : 'no', matchId]);
+
+  if (isYes) {
+    await sendMessage(from, "Thank you! We've noted your response. Someone from LifeDrop will follow up with you shortly. 🙏");
+  } else {
+    await sendMessage(from, "No problem, thanks for letting us know. We'll reach out next time there's a match.");
+  }
 }
 
 async function sendDonorFlow(to) {
@@ -200,6 +253,25 @@ async function sendMessage(to, text) {
   await axios.post(
     `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
     { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+}
+
+async function sendButtons(to, bodyText, buttons) {
+  await axios.post(
+    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        body: { text: bodyText },
+        action: {
+          buttons: buttons.map(b => ({ type: 'reply', reply: { id: b.id, title: b.title } }))
+        }
+      }
+    },
     { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
