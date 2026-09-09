@@ -35,6 +35,7 @@ app.post('/webhook', async (req, res) => {
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (message) {
       const from = message.from;
+      await pool.query(`UPDATE donors SET last_inbound_at = NOW() WHERE phone = $1`, [from]);
 
       if (message.type === 'interactive' && message.interactive?.type === 'nfm_reply') {
         const flowResponse = JSON.parse(message.interactive.nfm_reply.response_json);
@@ -45,6 +46,11 @@ app.post('/webhook', async (req, res) => {
           await handleDonorResponse(from, buttonId);
         } else {
           await handleMessage(from, buttonId);
+        }
+      } else if (message.type === 'button' && message.button?.payload) {
+        const payload = message.button.payload;
+        if (payload.startsWith('match_')) {
+          await handleDonorResponse(from, payload);
         }
       } else {
         const text = message.text?.body?.trim() || '';
@@ -161,8 +167,8 @@ async function saveDonor(phone, d) {
   const email = d.email && d.email.trim() !== '' ? d.email.trim() : null;
 
   await pool.query(
-    `INSERT INTO donors (name, phone, country, blood_type, city, age, weight_kg, email, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing, consent_given, no_payment_ack, eligibility_status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    `INSERT INTO donors (name, phone, country, blood_type, city, age, weight_kg, email, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing, consent_given, no_payment_ack, eligibility_status, last_inbound_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
      ON CONFLICT (phone) DO UPDATE SET
        name=$1, country=$3, blood_type=$4, city=$5, age=$6, weight_kg=$7, email=$8, on_medication=$9, chronic_condition=$10, recent_illness=$11, recent_tattoo_piercing=$12, consent_given=$13, no_payment_ack=$14, eligibility_status=$15`,
     [
@@ -188,10 +194,10 @@ async function saveRequestAndMatch(phone, d) {
   );
   const requestId = result.rows[0].id;
   const neededUnits = d.units_needed || 1;
-  const notifyCount = neededUnits + 1; // always one extra donor notified as fallback buffer
+  const notifyCount = neededUnits + 1;
 
   const matchedDonors = await pool.query(
-    `SELECT id, phone FROM donors WHERE blood_type = $1 AND city ILIKE $2 AND eligibility_status = 'eligible' LIMIT $3`,
+    `SELECT id, phone, last_inbound_at FROM donors WHERE blood_type = $1 AND city ILIKE $2 AND eligibility_status = 'eligible' LIMIT $3`,
     [d.blood_type_needed, `%${d.location}%`, notifyCount]
   );
 
@@ -200,21 +206,60 @@ async function saveRequestAndMatch(phone, d) {
       `INSERT INTO matches (request_id, donor_id, contacted_at) VALUES ($1, $2, NOW()) RETURNING id`,
       [requestId, donor.id]
     );
-    await notifyDonor(donor.phone, matchResult.rows[0].id, d);
+    await notifyDonor(donor.phone, donor.last_inbound_at, matchResult.rows[0].id, d);
   }
 
   return matchedDonors.rows.length;
 }
 
-async function notifyDonor(donorPhone, matchId, requestData) {
-  const hospitalLine = requestData.hospital_name ? ` at ${requestData.hospital_name}` : '';
-  const unitsLine = requestData.units_needed ? ` (${requestData.units_needed} unit(s) needed total)` : '';
-  const body = `🩸 Blood needed: ${requestData.blood_type_needed} in ${requestData.location}${hospitalLine}.\nUrgency: ${requestData.urgency}${unitsLine}\n\nReminder: LifeDrop doesn't pay donors — any support is arranged directly with the requester.\n\nCan you donate?`;
+async function notifyDonor(donorPhone, lastInboundAt, matchId, requestData) {
+  const withinWindow = lastInboundAt && (Date.now() - new Date(lastInboundAt).getTime()) < 24 * 60 * 60 * 1000;
 
-  await sendButtons(donorPhone, body, [
-    { id: `match_yes_${matchId}`, title: 'Yes, I can' },
-    { id: `match_no_${matchId}`, title: 'Not available' }
-  ]);
+  if (withinWindow) {
+    const hospitalLine = requestData.hospital_name ? ` at ${requestData.hospital_name}` : '';
+    const unitsLine = requestData.units_needed ? ` (${requestData.units_needed} unit(s) needed total)` : '';
+    const body = `🩸 Blood needed: ${requestData.blood_type_needed} in ${requestData.location}${hospitalLine}.\nUrgency: ${requestData.urgency}${unitsLine}\n\nReminder: LifeDrop doesn't pay donors — any support is arranged directly with the requester.\n\nCan you donate?`;
+    await sendButtons(donorPhone, body, [
+      { id: `match_yes_${matchId}`, title: 'Yes, I can' },
+      { id: `match_no_${matchId}`, title: 'Not available' }
+    ]);
+  } else {
+    await sendDonorMatchTemplate(donorPhone, matchId, requestData);
+  }
+}
+
+async function sendDonorMatchTemplate(donorPhone, matchId, requestData) {
+  await axios.post(
+    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to: donorPhone,
+      type: 'template',
+      template: {
+        name: 'donor_match_alert',
+        language: { code: 'en' },
+        components: [
+          {
+            type: 'body',
+            parameters: [
+              { type: 'text', text: requestData.blood_type_needed },
+              { type: 'text', text: requestData.location },
+              { type: 'text', text: requestData.urgency }
+            ]
+          },
+          {
+            type: 'button', sub_type: 'quick_reply', index: '0',
+            parameters: [{ type: 'payload', payload: `match_yes_${matchId}` }]
+          },
+          {
+            type: 'button', sub_type: 'quick_reply', index: '1',
+            parameters: [{ type: 'payload', payload: `match_no_${matchId}` }]
+          }
+        ]
+      }
+    },
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
 }
 
 async function handleDonorResponse(from, buttonId) {
@@ -229,7 +274,7 @@ async function handleDonorResponse(from, buttonId) {
   if (matchRow.rows.length === 0) return;
   const { request_id, response: existingResponse, units_needed, requester_phone, blood_type_needed, location, hospital_name } = matchRow.rows[0];
 
-  if (existingResponse) return; // already responded, ignore duplicate tap
+  if (existingResponse) return;
 
   if (!isYes) {
     await pool.query(`UPDATE matches SET response = 'no' WHERE id = $1`, [matchId]);
@@ -244,12 +289,10 @@ async function handleDonorResponse(from, buttonId) {
   const acceptedSoFar = parseInt(acceptedCountResult.rows[0].count, 10);
 
   if (acceptedSoFar >= neededUnits) {
-    // quota already filled by someone else who responded first
     await pool.query(`UPDATE matches SET response = 'not_needed' WHERE id = $1`, [matchId]);
     return sendMessage(from, "Thanks so much for responding! We've already secured enough donors for this request. We'll reach out next time there's a match. 🙏");
   }
 
-  // Accept this donor — one pint per donor.
   await pool.query(`UPDATE matches SET response = 'yes' WHERE id = $1`, [matchId]);
   const donorInfo = await pool.query(`SELECT name FROM donors WHERE phone = $1`, [from]);
   const donorName = donorInfo.rows[0]?.name || 'A donor';
