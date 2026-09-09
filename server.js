@@ -10,6 +10,7 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const DONOR_FLOW_ID = '2716596505409098'; // your Donor Registration Flow ID
+const COMMUNITY_LINK = process.env.COMMUNITY_LINK || 'https://chat.whatsapp.com/REPLACE_ME';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -102,6 +103,7 @@ async function handleMessage(from, text) {
 async function handleFlowSubmission(from, flowData) {
   await saveDonor(from, flowData);
   await sendMessage(from, "Thank you! You're registered as a LifeDrop donor. We'll reach out when there's a matching request nearby. 🩸");
+  await sendCommunityLinkIfNeeded(from);
 }
 
 async function saveDonor(phone, d) {
@@ -110,18 +112,31 @@ async function saveDonor(phone, d) {
   const illness = d.recent_illness === 'yes';
   const tattoo = d.recent_tattoo_piercing === 'yes';
   const consent = d.consent && d.consent.includes('agree');
+  const email = d.email && d.email.trim() !== '' ? d.email.trim() : null;
 
   await pool.query(
-    `INSERT INTO donors (name, phone, blood_type, city, age, weight_kg, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing, consent_given, eligibility_status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    `INSERT INTO donors (name, phone, country, blood_type, city, age, weight_kg, email, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing, consent_given, eligibility_status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
      ON CONFLICT (phone) DO UPDATE SET
-       name=$1, blood_type=$3, city=$4, age=$5, weight_kg=$6, on_medication=$7, chronic_condition=$8, recent_illness=$9, recent_tattoo_piercing=$10, consent_given=$11, eligibility_status=$12`,
+       name=$1, country=$3, blood_type=$4, city=$5, age=$6, weight_kg=$7, email=$8, on_medication=$9, chronic_condition=$10, recent_illness=$11, recent_tattoo_piercing=$12, consent_given=$13, eligibility_status=$14`,
     [
-      d.name, phone, d.blood_type, d.city, d.age, d.weight_kg,
+      d.name, phone, d.country, d.blood_type, d.city, d.age, d.weight_kg, email,
       onMed, chronic, illness, tattoo, consent,
       (onMed || chronic || illness || tattoo) ? 'needs_review' : 'eligible'
     ]
   );
+}
+
+async function sendCommunityLinkIfNeeded(phone) {
+  const result = await pool.query(`SELECT community_link_sent FROM donors WHERE phone = $1`, [phone]);
+  const alreadySent = result.rows[0]?.community_link_sent;
+  if (alreadySent) return;
+
+  await sendMessage(
+    phone,
+    `Want to connect with other donors, ask questions, and get updates from real people on our team? Join the LifeDrop community here: ${COMMUNITY_LINK}`
+  );
+  await pool.query(`UPDATE donors SET community_link_sent = TRUE WHERE phone = $1`, [phone]);
 }
 
 async function saveRequestAndMatch(phone, d) {
