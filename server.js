@@ -9,7 +9,7 @@ app.use(bodyParser.json());
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const DONOR_FLOW_ID = '2716596505409098'; // your Donor Registration Flow ID
+const DONOR_FLOW_ID = '2716596505409098';
 const COMMUNITY_LINK = 'https://chat.whatsapp.com/EPIAr0zFQxVEYXru4PmRwF?s=cl&p=a&mlu=4&ilr=4';
 
 const pool = new Pool({
@@ -35,8 +35,6 @@ app.post('/webhook', async (req, res) => {
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (message) {
       const from = message.from;
-
-      // Handle a completed WhatsApp Flow submission
       if (message.type === 'interactive' && message.interactive?.type === 'nfm_reply') {
         const flowResponse = JSON.parse(message.interactive.nfm_reply.response_json);
         await handleFlowSubmission(from, flowResponse);
@@ -63,13 +61,18 @@ async function handleMessage(from, text) {
   }
 
   switch (session.step) {
-    case 'start':
+    case 'start': {
       session.step = 'menu';
+      const existing = await pool.query('SELECT name FROM donors WHERE phone = $1', [from]);
+      if (existing.rows.length > 0) {
+        return sendMessage(from, `Welcome back, ${existing.rows[0].name}! 🩸\nReply:\n1 - Update my donor info\n2 - Request blood`);
+      }
       return sendMessage(from, "Welcome to LifeDrop 🩸\nReply:\n1 - Register as a blood donor\n2 - Request blood");
+    }
 
     case 'menu':
       if (text === '1') {
-        sessions[from] = { step: 'start', data: {} }; // reset, Flow handles the rest
+        sessions[from] = { step: 'start', data: {} };
         return sendDonorFlow(from);
       } else if (text === '2') {
         session.step = 'request_blood_type';
@@ -85,14 +88,20 @@ async function handleMessage(from, text) {
 
     case 'request_location':
       session.data.location = text;
+      session.step = 'request_hospital';
+      return sendMessage(from, "Which hospital or clinic? (name it, or reply 'skip')");
+
+    case 'request_hospital':
+      session.data.hospital_name = text.toLowerCase() === 'skip' ? null : text;
       session.step = 'request_urgency';
       return sendMessage(from, "How urgent is this? (e.g. immediate, today, this week)");
 
-    case 'request_urgency':
+    case 'request_urgency': {
       session.data.urgency = text;
       const matchCount = await saveRequestAndMatch(from, session.data);
       sessions[from] = { step: 'start', data: {} };
       return sendMessage(from, `Request logged. Found ${matchCount} potential matching donor(s) in ${session.data.location}. We're reaching out to them now.`);
+    }
 
     default:
       sessions[from] = { step: 'start', data: {} };
@@ -141,8 +150,8 @@ async function sendCommunityLinkIfNeeded(phone) {
 
 async function saveRequestAndMatch(phone, d) {
   const result = await pool.query(
-    `INSERT INTO requests (requester_phone, blood_type_needed, location, urgency) VALUES ($1,$2,$3,$4) RETURNING id`,
-    [phone, d.blood_type_needed, d.location, d.urgency]
+    `INSERT INTO requests (requester_phone, blood_type_needed, location, hospital_name, urgency) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+    [phone, d.blood_type_needed, d.location, d.hospital_name, d.urgency]
   );
   const requestId = result.rows[0].id;
 
