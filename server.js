@@ -197,7 +197,7 @@ async function saveRequestAndMatch(phone, d) {
   const notifyCount = neededUnits + 1;
 
   const matchedDonors = await pool.query(
-    `SELECT id, phone, last_inbound_at FROM donors WHERE blood_type = $1 AND city ILIKE $2 AND eligibility_status = 'eligible' LIMIT $3`,
+    `SELECT id, name, phone, last_inbound_at FROM donors WHERE blood_type = $1 AND city ILIKE $2 AND eligibility_status = 'eligible' LIMIT $3`,
     [d.blood_type_needed, `%${d.location}%`, notifyCount]
   );
 
@@ -206,29 +206,29 @@ async function saveRequestAndMatch(phone, d) {
       `INSERT INTO matches (request_id, donor_id, contacted_at) VALUES ($1, $2, NOW()) RETURNING id`,
       [requestId, donor.id]
     );
-    await notifyDonor(donor.phone, donor.last_inbound_at, matchResult.rows[0].id, d);
+    await notifyDonor(donor.name, donor.phone, donor.last_inbound_at, matchResult.rows[0].id, d);
   }
 
   return matchedDonors.rows.length;
 }
 
-async function notifyDonor(donorPhone, lastInboundAt, matchId, requestData) {
+async function notifyDonor(donorName, donorPhone, lastInboundAt, matchId, requestData) {
   const withinWindow = lastInboundAt && (Date.now() - new Date(lastInboundAt).getTime()) < 24 * 60 * 60 * 1000;
 
   if (withinWindow) {
     const hospitalLine = requestData.hospital_name ? ` at ${requestData.hospital_name}` : '';
     const unitsLine = requestData.units_needed ? ` (${requestData.units_needed} unit(s) needed total)` : '';
-    const body = `🩸 Blood needed: ${requestData.blood_type_needed} in ${requestData.location}${hospitalLine}.\nUrgency: ${requestData.urgency}${unitsLine}\n\nReminder: LifeDrop doesn't pay donors — any support is arranged directly with the requester.\n\nCan you donate?`;
+    const body = `Hello ${donorName}! 🩸 Blood needed: ${requestData.blood_type_needed} in ${requestData.location}${hospitalLine}.\nUrgency: ${requestData.urgency}${unitsLine}\n\nReminder: LifeDrop doesn't pay donors — any support is arranged directly with the requester.\n\nCan you donate?`;
     await sendButtons(donorPhone, body, [
       { id: `match_yes_${matchId}`, title: 'Yes, I can' },
       { id: `match_no_${matchId}`, title: 'Not available' }
     ]);
   } else {
-    await sendDonorMatchTemplate(donorPhone, matchId, requestData);
+    await sendDonorMatchTemplate(donorName, donorPhone, matchId, requestData);
   }
 }
 
-async function sendDonorMatchTemplate(donorPhone, matchId, requestData) {
+async function sendDonorMatchTemplate(donorName, donorPhone, matchId, requestData) {
   await axios.post(
     `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
     {
@@ -242,6 +242,7 @@ async function sendDonorMatchTemplate(donorPhone, matchId, requestData) {
           {
             type: 'body',
             parameters: [
+              { type: 'text', text: donorName },
               { type: 'text', text: requestData.blood_type_needed },
               { type: 'text', text: requestData.location },
               { type: 'text', text: requestData.urgency }
