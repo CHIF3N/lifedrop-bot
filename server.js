@@ -6,14 +6,13 @@ const { Pool } = require('pg');
 const app = express();
 app.use(bodyParser.json());
 
+// Environment configuration
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const CS_PHONE_NUMBER = process.env.CS_PHONE_NUMBER;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-// NOTE: Replace with the new published Flow ID from WABA 1095708656227443
-const DONOR_FLOW_ID = '1747598403124876';
+const DONOR_FLOW_ID = process.env.DONOR_FLOW_ID || '2716596505409098';
 const COMMUNITY_LINK = 'https://chat.whatsapp.com/EPIAr0zFQxVEYXru4PmRwF?s=cl&p=a&mlu=4&ilr=4';
 
 const pool = new Pool({
@@ -21,8 +20,26 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Auto-verify schema on startup to prevent column-missing runtime crashes
+async function initDb() {
+  try {
+    await pool.query(`
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS hospital_name TEXT;
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS units_needed INTEGER DEFAULT 1;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS email TEXT;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS last_inbound_at TIMESTAMP;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS community_link_sent BOOLEAN DEFAULT FALSE;
+    `);
+    console.log('✅ Database schema verified.');
+  } catch (err) {
+    console.warn('⚠️ Database schema verification warning:', err.message);
+  }
+}
+initDb();
+
 const sessions = {};
 
+// Webhook Verification
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -34,12 +51,15 @@ app.get('/webhook', (req, res) => {
   }
 });
 
+// Webhook Event Receiver
 app.post('/webhook', async (req, res) => {
   try {
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (message) {
       const from = message.from;
-      await pool.query(`UPDATE donors SET last_inbound_at = NOW() WHERE phone = $1`, [from]);
+
+      // Track last user interaction for 24h messaging window
+      pool.query(`UPDATE donors SET last_inbound_at = NOW() WHERE phone = $1`, [from]).catch(() => {});
 
       if (message.type === 'interactive' && message.interactive?.type === 'nfm_reply') {
         const flowResponse = JSON.parse(message.interactive.nfm_reply.response_json);
@@ -59,6 +79,8 @@ app.post('/webhook', async (req, res) => {
           await handleDonorResponse(from, payload);
         } else if (payload.startsWith('req_followup_')) {
           await handleRequesterFollowUp(from, payload);
+        } else {
+          await handleMessage(from, payload);
         }
       } else {
         const text = message.text?.body?.trim() || '';
@@ -66,19 +88,27 @@ app.post('/webhook', async (req, res) => {
       }
     }
   } catch (err) {
-    console.error('Error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
+    console.error('Webhook processing error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
   }
   res.sendStatus(200);
 });
 
+// Safe Customer Service Notifications (Never crashes requester flows)
 async function notifyCustomerService(text) {
   if (!CS_PHONE_NUMBER) {
-    console.log('[CS Notification]:', text);
+    console.log('[CS Log (No Phone Configured)]:\n', text);
     return;
   }
-  await sendMessage(CS_PHONE_NUMBER, text);
+  const cleanNumber = CS_PHONE_NUMBER.replace(/\D/g, '');
+  try {
+    await sendMessage(cleanNumber, text);
+  } catch (err) {
+    console.warn('⚠️ Could not deliver CS message (check 24h window or phone ID):', err.response?.data?.error?.message || err.message);
+    console.log('📌 CS Alert Fallback Output:\n', text);
+  }
 }
 
+// AI Smart Redirection for Off-Context Questions
 async function askGeminiGuidance(userText) {
   if (!GEMINI_API_KEY) return null;
   try {
@@ -88,19 +118,20 @@ async function askGeminiGuidance(userText) {
         contents: [{ parts: [{ text: userText }] }],
         systemInstruction: {
           parts: [{
-            text: "You are the AI assistant for LifeDrop, a WhatsApp-based blood donor network in Cameroon. The user asked an off-topic or conversational question. In 1 or 2 concise, polite sentences, answer or acknowledge their question, clarify that LifeDrop is a voluntary, non-profit donor matching service (we do not pay donors), and guide them to reply '1' to register as a donor or '2' to request blood. Keep response under 50 words."
+            text: "You are the automated WhatsApp assistant for LifeDrop, a voluntary blood donor network in Cameroon. The user sent an off-topic question. In 1 or 2 polite sentences, answer or acknowledge their question, clarify that LifeDrop is a voluntary service connecting donors and patients (we do not sell blood or pay donors), and guide them to reply '1' to register as a donor or '2' to request blood. Keep response strictly under 45 words."
           }]
         }
       },
-      { timeout: 8000 }
+      { timeout: 7000 }
     );
     return res.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
   } catch (err) {
-    console.error('Gemini API error:', err.response?.data || err.message);
+    console.warn('Gemini API error:', err.response?.data?.error?.message || err.message);
     return null;
   }
 }
 
+// Main Conversation Router
 async function handleMessage(from, text) {
   if (!sessions[from]) {
     sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
@@ -109,10 +140,10 @@ async function handleMessage(from, text) {
 
   if (text.toLowerCase() === 'restart') {
     sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
-    return sendMessage(from, "Restarted. Welcome to LifeDrop! Reply:\n1 - Register as a blood donor\n2 - Request blood");
+    return sendMessage(from, "Restarted. Welcome to LifeDrop! 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood");
   }
 
-  // Handle post-signup review / feedback
+  // Handle post-signup review
   if (session.step === 'awaiting_feedback') {
     if (text.toLowerCase() !== 'skip') {
       await notifyCustomerService(
@@ -120,7 +151,7 @@ async function handleMessage(from, text) {
       );
       await sendMessage(from, "Thank you for your feedback! It helps us improve our service and save lives. 🙏");
     } else {
-      await sendMessage(from, "No problem! You're all set.");
+      await sendMessage(from, "You're all set! We will notify you when a patient nearby needs your blood type.");
     }
     sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
     return;
@@ -131,9 +162,9 @@ async function handleMessage(from, text) {
       session.step = 'menu';
       const existing = await pool.query('SELECT name FROM donors WHERE phone = $1', [from]);
       if (existing.rows.length > 0) {
-        return sendMessage(from, `Welcome back, ${existing.rows[0].name}! 🩸\nReply:\n1 - Update my donor info\n2 - Request blood`);
+        return sendMessage(from, `Welcome back, ${existing.rows[0].name}! 🩸\n\nReply:\n1 - Update my donor info\n2 - Request blood`);
       }
-      return sendMessage(from, "Welcome to LifeDrop 🩸\nReply:\n1 - Register as a blood donor\n2 - Request blood");
+      return sendMessage(from, "Welcome to LifeDrop 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood");
     }
 
     case 'menu':
@@ -144,7 +175,6 @@ async function handleMessage(from, text) {
         session.step = 'request_blood_type';
         return sendMessage(from, "What blood type is needed? (e.g. A+, O-, B+, AB+)");
       } else {
-        // AI Fallback for off-context questions (limit to 3 times)
         session.aiAttempts = (session.aiAttempts || 0) + 1;
         if (session.aiAttempts <= 3) {
           const aiResponse = await askGeminiGuidance(text);
@@ -156,12 +186,12 @@ async function handleMessage(from, text) {
     case 'request_blood_type':
       session.data.blood_type_needed = text.toUpperCase();
       session.step = 'request_location';
-      return sendMessage(from, "What city/location is the patient in?");
+      return sendMessage(from, "What city or town is the patient in?");
 
     case 'request_location':
       session.data.location = text;
       session.step = 'request_hospital';
-      return sendMessage(from, "Which hospital or clinic? (name it, or reply 'skip')");
+      return sendMessage(from, "Which hospital or clinic? (enter hospital name, or reply 'skip')");
 
     case 'request_hospital':
       session.data.hospital_name = text.toLowerCase() === 'skip' ? null : text;
@@ -170,7 +200,7 @@ async function handleMessage(from, text) {
 
     case 'request_units': {
       const parsed = parseInt(text, 10);
-      session.data.units_needed = isNaN(parsed) ? null : parsed;
+      session.data.units_needed = isNaN(parsed) || parsed < 1 ? 1 : parsed;
       session.step = 'request_urgency';
       return sendButtons(from, "How urgent is this?", [
         { id: 'urgency_routine', title: 'Routine' },
@@ -185,7 +215,7 @@ async function handleMessage(from, text) {
       session.step = 'request_consent';
       return sendButtons(
         from,
-        "Before we proceed: do you agree to arrange any transport, feeding, or other support directly with the donor? LifeDrop does not pay donors and does not manage or guarantee any compensation — that's strictly between you and the donor.",
+        "Before we proceed: do you agree to arrange any transport, feeding, or other support directly with the donor? LifeDrop does not pay donors and does not manage compensation.",
         [
           { id: 'consent_agree', title: 'I agree' },
           { id: 'consent_decline', title: 'Cancel' }
@@ -196,44 +226,67 @@ async function handleMessage(from, text) {
     case 'request_consent': {
       if (text === 'consent_decline') {
         sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
-        return sendMessage(from, "No worries — request cancelled. Message us anytime you're ready.");
+        return sendMessage(from, "Request cancelled. Message us anytime you need assistance.");
       }
-      const matchCount = await saveRequestAndMatch(from, session.data);
-      sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
-      if (matchCount === 0) {
-        return sendMessage(from, `Request logged. We currently do not have matching donors available in ${session.data.location}. Our customer support team has been notified to assist manually.`);
+
+      if (text !== 'consent_agree') {
+        return sendButtons(
+          from,
+          "Please select an option below to proceed:",
+          [
+            { id: 'consent_agree', title: 'I agree' },
+            { id: 'consent_decline', title: 'Cancel' }
+          ]
+        );
       }
-      return sendMessage(from, `Request logged. Reaching out to ${matchCount} potential donor(s) in ${session.data.location} now. We'll message you as soon as someone confirms.`);
+
+      const requestPayload = { ...session.data };
+      sessions[from] = { step: 'start', data: {}, aiAttempts: 0 }; // Clear session state immediately
+
+      try {
+        const matchCount = await saveRequestAndMatch(from, requestPayload);
+        if (matchCount === 0) {
+          return sendMessage(from, `Request logged. We currently do not have eligible donors matching ${requestPayload.blood_type_needed} in ${requestPayload.location}. Our support team has been notified to assist manually.`);
+        }
+        return sendMessage(from, `Request logged. Reaching out to ${matchCount} eligible donor(s) in ${requestPayload.location} now. We will notify you the moment someone confirms.`);
+      } catch (err) {
+        console.error('Failed processing blood request:', err);
+        return sendMessage(from, "Your request was logged, but we experienced an issue reaching out to donors automatically. Our customer support team has been notified.");
+      }
     }
 
     default:
       sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
-      return sendMessage(from, "Let's start over. Welcome to LifeDrop 🩸\nReply:\n1 - Register as a blood donor\n2 - Request blood");
+      return sendMessage(from, "Let's start over. Welcome to LifeDrop 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood");
   }
 }
 
+// Flow Submission Handler
 async function handleFlowSubmission(from, flowData) {
-  await saveDonor(from, flowData);
-  
-  // Get donor count for CS tracking
-  const countResult = await pool.query(`SELECT COUNT(*) FROM donors`);
-  const totalDonors = countResult.rows[0].count;
+  try {
+    await saveDonor(from, flowData);
 
-  const bloodTypeDisplay = flowData.blood_type === 'UNKNOWN' ? "Unknown / Not sure (Needs blood typing)" : flowData.blood_type;
+    const countResult = await pool.query(`SELECT COUNT(*) FROM donors`);
+    const totalDonors = countResult.rows[0].count;
 
-  // Send CS notification
-  await notifyCustomerService(
-    `🆕 *New Donor Registered!*\n\n👤 *Name:* ${flowData.name}\n📞 *Phone:* ${from}\n🩸 *Blood Group:* ${bloodTypeDisplay}\n📍 *City:* ${flowData.city}\n📊 *Total Donors in System:* ${totalDonors}`
-  );
+    const bloodTypeLabel = flowData.blood_type === 'UNKNOWN' ? "Unknown (Needs Typing)" : flowData.blood_type;
 
-  await sendMessage(from, "Thank you! You're registered as a LifeDrop donor. We'll reach out when there's a matching request nearby. Reminder: LifeDrop doesn't pay donors — any support is arranged directly with the requester. 🩸");
-  await sendCommunityLinkIfNeeded(from);
+    await notifyCustomerService(
+      `🆕 *New Donor Registered!*\n\n👤 *Name:* ${flowData.name}\n📞 *Phone:* ${from}\n🩸 *Blood Group:* ${bloodTypeLabel}\n📍 *City:* ${flowData.city}\n📊 *Total Donors:* ${totalDonors}`
+    );
 
-  // Set session to collect user review
-  sessions[from] = { step: 'awaiting_feedback', data: { donorName: flowData.name }, aiAttempts: 0 };
-  await sendMessage(from, "⭐ *Quick Feedback:* How was your registration experience? Reply with a rating (1-5) or a quick comment, or reply 'skip'.");
+    await sendMessage(from, "Thank you! You are officially registered as a LifeDrop donor. We'll reach out when a matching patient nearby needs blood. Reminder: LifeDrop does not pay donors. 🩸");
+    await sendCommunityLinkIfNeeded(from);
+
+    sessions[from] = { step: 'awaiting_feedback', data: { donorName: flowData.name }, aiAttempts: 0 };
+    await sendMessage(from, "⭐ *Quick Feedback:* How was your registration experience? Reply with a rating (1-5) or a quick comment, or reply 'skip'.");
+  } catch (err) {
+    console.error('Error handling flow submission:', err);
+    await sendMessage(from, "Thank you for submitting! Your details have been received.");
+  }
 }
 
+// Database Upsert for Donors
 async function saveDonor(phone, d) {
   const onMed = d.on_medication === 'yes';
   const chronic = d.chronic_condition === 'yes';
@@ -246,26 +299,35 @@ async function saveDonor(phone, d) {
   const parsedAge = parseInt(d.age, 10) || null;
   const parsedWeight = parseInt(d.weight_kg, 10) || null;
 
+  const isEligible = !onMed && !chronic && !illness && !tattoo && d.blood_type !== 'UNKNOWN';
+
   await pool.query(
     `INSERT INTO donors (name, phone, country, blood_type, city, age, weight_kg, email, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing, consent_given, no_payment_ack, eligibility_status, last_inbound_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
      ON CONFLICT (phone) DO UPDATE SET
-       name=$1, country=$3, blood_type=$4, city=$5, age=$6, weight_kg=$7, email=$8, on_medication=$9, chronic_condition=$10, recent_illness=$11, recent_tattoo_piercing=$12, consent_given=$13, no_payment_ack=$14, eligibility_status=$15`,
+       name=$1, country=$3, blood_type=$4, city=$5, age=$6, weight_kg=$7, email=$8, on_medication=$9, chronic_condition=$10, recent_illness=$11, recent_tattoo_piercing=$12, consent_given=$13, no_payment_ack=$14, eligibility_status=$15, last_inbound_at=NOW()`,
     [
       d.name, phone, d.country, d.blood_type, d.city, parsedAge, parsedWeight, email,
       onMed, chronic, illness, tattoo, consent, noPaymentAck,
-      (onMed || chronic || illness || tattoo) ? 'needs_review' : 'eligible'
+      isEligible ? 'eligible' : 'needs_review'
     ]
   );
 }
 
+// Community Invite Helper
 async function sendCommunityLinkIfNeeded(phone) {
-  const result = await pool.query(`SELECT community_link_sent FROM donors WHERE phone = $1`, [phone]);
-  if (result.rows[0]?.community_link_sent) return;
-  await sendMessage(phone, `Want to connect with other donors, ask questions, and get updates from real people on our team? Join the LifeDrop community here: ${COMMUNITY_LINK}`);
-  await pool.query(`UPDATE donors SET community_link_sent = TRUE WHERE phone = $1`, [phone]);
+  try {
+    const result = await pool.query(`SELECT community_link_sent FROM donors WHERE phone = $1`, [phone]);
+    if (result.rows[0]?.community_link_sent) return;
+
+    await sendMessage(phone, `Want to connect with other donors, ask questions, and get updates from our team? Join our WhatsApp community here: ${COMMUNITY_LINK}`);
+    await pool.query(`UPDATE donors SET community_link_sent = TRUE WHERE phone = $1`, [phone]);
+  } catch (err) {
+    console.warn('Could not check or send community link:', err.message);
+  }
 }
 
+// Request Matching Engine
 async function saveRequestAndMatch(phone, d) {
   const result = await pool.query(
     `INSERT INTO requests (requester_phone, blood_type_needed, location, hospital_name, units_needed, urgency) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
@@ -282,7 +344,7 @@ async function saveRequestAndMatch(phone, d) {
 
   if (matchedDonors.rows.length === 0) {
     await notifyCustomerService(
-      `⚠️ *NO DONOR MATCH FOUND!*\n\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'Not specified'}\n⚡ *Urgency:* ${d.urgency}\n📞 *Requester Phone:* ${phone}\n\n*Action Required:* Check alternate locations or manual outreach.`
+      `⚠️ *NO DONOR MATCH FOUND!*\n\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'Not specified'}\n⚡ *Urgency:* ${d.urgency}\n📞 *Requester Phone:* ${phone}\n\n*Action Required:* Manual donor outreach needed.`
     );
   } else {
     await notifyCustomerService(
@@ -290,21 +352,24 @@ async function saveRequestAndMatch(phone, d) {
     );
 
     for (const donor of matchedDonors.rows) {
-      const matchResult = await pool.query(
-        `INSERT INTO matches (request_id, donor_id, contacted_at) VALUES ($1, $2, NOW()) RETURNING id`,
-        [requestId, donor.id]
-      );
-      await notifyDonor(donor.name, donor.phone, donor.last_inbound_at, matchResult.rows[0].id, d);
+      try {
+        const matchResult = await pool.query(
+          `INSERT INTO matches (request_id, donor_id, contacted_at) VALUES ($1, $2, NOW()) RETURNING id`,
+          [requestId, donor.id]
+        );
+        await notifyDonor(donor.name, donor.phone, donor.last_inbound_at, matchResult.rows[0].id, d);
+      } catch (err) {
+        console.error(`Failed to notify donor ${donor.id}:`, err.message);
+      }
     }
   }
 
-  // 10-Minute Follow-Up Check with the Requester
-  scheduleRequesterFollowUp(phone, requestId, d);
-
+  scheduleRequesterFollowUp(phone, requestId);
   return matchedDonors.rows.length;
 }
 
-function scheduleRequesterFollowUp(phone, requestId, requestData) {
+// 10-Minute Requester Follow-Up Timer
+function scheduleRequesterFollowUp(phone, requestId) {
   setTimeout(async () => {
     try {
       const check = await pool.query(`SELECT status FROM requests WHERE id = $1`, [requestId]);
@@ -312,35 +377,37 @@ function scheduleRequesterFollowUp(phone, requestId, requestData) {
 
       await sendButtons(
         phone,
-        "Hi, this is LifeDrop checking in. It has been 10 minutes since your request was logged. Have you connected with a donor?",
+        "Hi, this is LifeDrop checking in. It has been 10 minutes since your request was logged. Have you connected with a donor yet?",
         [
           { id: `req_followup_yes_${requestId}`, title: 'Yes, connected' },
           { id: `req_followup_no_${requestId}`, title: 'Still searching' }
         ]
       );
     } catch (err) {
-      console.error('Follow-up error:', err.message);
+      console.warn('Follow-up timer error:', err.message);
     }
-  }, 10 * 60 * 1000); // 10 minutes
+  }, 10 * 60 * 1000);
 }
 
+// Handler for 10-minute follow-up response
 async function handleRequesterFollowUp(from, buttonId) {
   const isYes = buttonId.startsWith('req_followup_yes_');
   const reqId = buttonId.replace('req_followup_yes_', '').replace('req_followup_no_', '');
 
   if (isYes) {
-    await sendMessage(from, "Glad to hear that! We hope the donation process goes smoothly. Please reach out if you need anything else.");
+    await sendMessage(from, "Glad to hear that! We hope the donation process goes smoothly. Reach out anytime if you need more assistance.");
     await notifyCustomerService(
-      `✅ *Requester Update (10-min check)*\n\n📞 *Requester:* ${from}\n🆔 *Request ID:* ${reqId}\n*Status:* Confirmed they have connected with a donor.`
+      `✅ *Requester Update (10-min check)*\n\n📞 *Requester:* ${from}\n🆔 *Request ID:* ${reqId}\n*Status:* Confirmed donor connection.`
     );
   } else {
-    await sendMessage(from, "Understood. Our customer service team has been notified and we will continue monitoring for available donors.");
+    await sendMessage(from, "Understood. Our team has been notified and will monitor available donors for you.");
     await notifyCustomerService(
-      `🚨 *URGENT: Requester Needs Help (10-min check)*\n\n📞 *Requester:* ${from}\n🆔 *Request ID:* ${reqId}\n*Status:* Has NOT connected with a donor yet. Manual follow-up required!`
+      `🚨 *URGENT: Requester Still Searching (10-min check)*\n\n📞 *Requester:* ${from}\n🆔 *Request ID:* ${reqId}\n*Status:* Has NOT connected with a donor yet. Manual support needed!`
     );
   }
 }
 
+// Notify donor via 24h interactive buttons or template
 async function notifyDonor(donorName, donorPhone, lastInboundAt, matchId, requestData) {
   const withinWindow = lastInboundAt && (Date.now() - new Date(lastInboundAt).getTime()) < 24 * 60 * 60 * 1000;
   if (withinWindow) {
@@ -356,6 +423,7 @@ async function notifyDonor(donorName, donorPhone, lastInboundAt, matchId, reques
   }
 }
 
+// Outbound Template Alert for 24h+ Window
 async function sendDonorMatchTemplate(donorName, donorPhone, matchId, requestData) {
   await axios.post(
     `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
@@ -391,6 +459,7 @@ async function sendDonorMatchTemplate(donorName, donorPhone, matchId, requestDat
   );
 }
 
+// Donor Accept/Decline Handler
 async function handleDonorResponse(from, buttonId) {
   const isYes = buttonId.startsWith('match_yes_');
   const matchId = buttonId.replace('match_yes_', '').replace('match_no_', '');
@@ -418,7 +487,7 @@ async function handleDonorResponse(from, buttonId) {
 
   if (acceptedSoFar >= neededUnits) {
     await pool.query(`UPDATE matches SET response = 'not_needed' WHERE id = $1`, [matchId]);
-    return sendMessage(from, "Thanks so much for responding! We've already secured enough donors for this request. We'll reach out next time there's a match. 🙏");
+    return sendMessage(from, "Thanks so much for being ready to help! We have already secured enough donors for this request. We will reach out next time there is a match. 🙏");
   }
 
   await pool.query(`UPDATE matches SET response = 'yes' WHERE id = $1`, [matchId]);
@@ -439,12 +508,13 @@ async function handleDonorResponse(from, buttonId) {
     );
     for (const pm of pendingMatches.rows) {
       await pool.query(`UPDATE matches SET response = 'not_needed' WHERE id = $1`, [pm.id]);
-      await sendMessage(pm.phone, "Thanks so much for being ready to help! We've found enough donors for this request already. We'll reach out next time there's a match. 🙏");
+      await sendMessage(pm.phone, "Thanks so much for offering to help! We've secured enough donors for this request. We will contact you next time there is a match. 🙏");
     }
     await pool.query(`UPDATE requests SET status = 'fulfilled' WHERE id = $1`, [request_id]);
   }
 }
 
+// Meta API Sender Wrappers
 async function sendDonorFlow(to) {
   await axios.post(
     `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
