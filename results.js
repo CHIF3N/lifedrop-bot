@@ -31,4 +31,23 @@ function neutralResultMessage(donorName, code, bloodGroup, facilityName) {
   return `Hi ${donorName}, here is an update on your blood donation (${code}). 🩸\n\nYour blood group is confirmed: *${bloodGroup}*.\n\nYour full test results are kept at ${facilityName || 'the blood bank'}. If you would like to ask about them, show your code there.\n\nThank you for donating!`;
 }
 
-module.exports = { BLOOD_GROUPS, parseResultsRequest, normalizeBloodGroup, parseResultButton, neutralResultMessage };
+// "LT-12345" / "lt 12345" (free test booking code shown to the donor) -> 'LT-12345', else null
+function parseLabCode(text) {
+  const m = /^LT-?\s?(\d{5})$/i.exec((text || '').trim());
+  return m ? `LT-${m[1]}` : null;
+}
+
+// A lab has confirmed the blood group: "I don't know" no longer needs review.
+// donor: { eligibility_status, screening_reasons, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing }
+function statusAfterBloodGroupConfirmed(donor) {
+  let status = donor.eligibility_status;
+  const reasons = (donor.screening_reasons || '').split(',').filter(r => r && r !== 'blood_type_unknown');
+  if (status === 'needs_review') {
+    const legacy = donor.screening_reasons == null; // registered with the old form: no reasons stored
+    const legacyOk = !donor.on_medication && !donor.chronic_condition && !donor.recent_illness && !donor.recent_tattoo_piercing;
+    if ((legacy && legacyOk) || (!legacy && reasons.length === 0)) status = 'eligible';
+  }
+  return { status, reasons: reasons.join(',') };
+}
+
+module.exports = { BLOOD_GROUPS, parseResultsRequest, normalizeBloodGroup, parseResultButton, neutralResultMessage, parseLabCode, statusAfterBloodGroupConfirmed };

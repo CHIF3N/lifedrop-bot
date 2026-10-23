@@ -24,6 +24,7 @@ Status column: **Used by bot** = code already sends it. **Text only** = submit n
 | 8 | `hospital_admin_notice` | Utility | Used by bot (welcome when you run `addhospital`) |
 | 9 | `hospital_donor_incoming` | Utility | Used by bot |
 | 10 | `hospital_request_alert` | Utility | Used by bot |
+| 11 | `blood_group_confirmed` | Utility | Used by bot |
 
 ---
 
@@ -153,3 +154,15 @@ Hello {{1}}, LifeDrop received blood request {{2}} for a patient at your facilit
 **Samples:** {{1}} `Buea Regional Hospital` · {{2}} `#42` · {{3}} `O+ x 2` · {{4}} `Emergency` · {{5}} `M. N.` · {{6}} `Paul (237677123456)`
 
 Sent when the family picks this partner hospital in the request flow.
+
+---
+
+## 11. `blood_group_confirmed` (Utility): lab confirmed the donor's blood group
+
+**Body**
+```
+Hi {{1}}, your blood group {{2}} has been confirmed by {{3}}. You are now a confirmed LifeDrop donor and can receive matching blood requests. Thank you!
+```
+**Samples:** {{1}} `Jean` · {{2}} `O+` · {{3}} `Buea Regional Lab`
+
+Used only when the donor hasn't messaged the bot in the last 24 hours when lab staff confirm their free test.
