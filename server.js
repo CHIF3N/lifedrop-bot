@@ -1,8 +1,10 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 const { daysUntilEligible } = require('./deferral');
+const { evaluateScreening } = require('./screening');
 
 const app = express();
 app.use(bodyParser.json());
@@ -14,7 +16,10 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const CS_PHONE_NUMBER = process.env.CS_PHONE_NUMBER;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const DONOR_FLOW_ID = process.env.DONOR_FLOW_ID || '1747598403124876';
-const DONATION_WAIT_DAYS = parseInt(process.env.DONATION_WAIT_DAYS, 10) || 90; // Rest period between confirmed donations
+// Rest period between confirmed whole-blood donations (WHO minimum: 12 weeks men, 16 weeks women)
+const DONATION_WAIT_DAYS_MALE = parseInt(process.env.DONATION_WAIT_DAYS_MALE, 10) || 90;
+const DONATION_WAIT_DAYS_FEMALE = parseInt(process.env.DONATION_WAIT_DAYS_FEMALE, 10) || 120;
+const donationWaitDays = (gender) => (gender === 'male' ? DONATION_WAIT_DAYS_MALE : DONATION_WAIT_DAYS_FEMALE);
 const COMMUNITY_LINK ='https://chat.whatsapp.com/EPIAr0zFQxVEYXru4PmRwF?s=cl&p=a&mlu=4&ilr=4';
 
 const pool = new Pool({
@@ -32,7 +37,35 @@ async function initDb() {
       ALTER TABLE donors ADD COLUMN IF NOT EXISTS last_inbound_at TIMESTAMP;
       ALTER TABLE donors ADD COLUMN IF NOT EXISTS community_link_sent BOOLEAN DEFAULT FALSE;
       ALTER TABLE donors ADD COLUMN IF NOT EXISTS last_donation_date DATE;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS gender TEXT;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS deferred_until DATE;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS screening_reasons TEXT;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS verified_at TIMESTAMP;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS verified_by_facility_id INTEGER;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS donation_confirmed BOOLEAN;
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS confirm_code TEXT;
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS confirmed_by_facility_id INTEGER;
+      CREATE TABLE IF NOT EXISTS facilities (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'hospital',
+        city TEXT,
+        region TEXT,
+        address TEXT,
+        latitude DOUBLE PRECISION,
+        longitude DOUBLE PRECISION,
+        staff_phone TEXT,
+        is_partner BOOLEAN DEFAULT FALSE,
+        does_blood_collection BOOLEAN DEFAULT FALSE,
+        does_lab_tests BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS feature_interest (
+        phone TEXT NOT NULL,
+        feature TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (phone, feature)
+      );
     `);
     console.log('✅ Database schema verified.');
   } catch (err) {
@@ -76,6 +109,8 @@ app.post('/webhook', async (req, res) => {
           await handleRequesterFollowUp(from, buttonId);
         } else if (buttonId.startsWith('donated_')) {
           await handleDonationConfirmation(from, buttonId);
+        } else if (buttonId.startsWith('fac_')) {
+          await handleFacilityConfirmation(from, buttonId);
         } else {
           await handleMessage(from, buttonId);
         }
@@ -92,7 +127,11 @@ app.post('/webhook', async (req, res) => {
         }
       } else {
         const text = message.text?.body?.trim() || '';
-        await handleMessage(from, text);
+        if (/^LD-?\s?\d{5}$/i.test(text)) {
+          await handleFacilityCode(from, text);
+        } else {
+          await handleMessage(from, text);
+        }
       }
     }
   } catch (err) {
@@ -148,7 +187,21 @@ async function handleMessage(from, text) {
 
   if (text.toLowerCase() === 'restart') {
     sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
-    return sendMessage(from, "Restarted. Welcome to LifeDrop! 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood");
+    return sendMessage(from, "Restarted. Welcome to LifeDrop! 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood\n3 - Home lab test (coming soon)");
+  }
+
+  // Home lab test waitlist (feature coming soon)
+  if (text === 'homelab_notify' || text === 'homelab_no') {
+    sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
+    if (text === 'homelab_no') {
+      return sendMessage(from, "No problem! Reply anytime if you need blood or want to register as a donor. 🩸");
+    }
+    await pool.query(
+      `INSERT INTO feature_interest (phone, feature) VALUES ($1, 'home_lab_test') ON CONFLICT DO NOTHING`,
+      [from]
+    );
+    await notifyCustomerService(`🧪 *Home Lab Test Interest*\n\n📞 *Phone:* ${from}`);
+    return sendMessage(from, "Great! You're on the list. We'll message you as soon as home lab tests are available. 🧪");
   }
 
   // Handle post-signup review
@@ -168,15 +221,22 @@ async function handleMessage(from, text) {
   switch (session.step) {
     case 'start': {
       session.step = 'menu';
-      const existing = await pool.query('SELECT name, last_donation_date FROM donors WHERE phone = $1', [from]);
+      const existing = await pool.query('SELECT name, last_donation_date, gender, deferred_until, eligibility_status FROM donors WHERE phone = $1', [from]);
       if (existing.rows.length > 0) {
-        const daysLeft = daysUntilEligible(existing.rows[0].last_donation_date, DONATION_WAIT_DAYS);
-        const restLine = daysLeft > 0
-          ? `\n\nThank you for your last donation! ❤️ You're on a rest break. You can donate again in ${daysLeft} day(s). We won't send you requests until then.`
-          : '';
-        return sendMessage(from, `Welcome back, ${existing.rows[0].name}! 🩸${restLine}\n\nReply:\n1 - Update my donor info\n2 - Request blood`);
+        const donor = existing.rows[0];
+        const restDays = daysUntilEligible(donor.last_donation_date, donationWaitDays(donor.gender));
+        const daysLeft = Math.max(restDays, daysUntilEligible(donor.deferred_until, 0));
+        let restLine = '';
+        if (donor.eligibility_status === 'needs_update') {
+          restLine = "\n\nYour donor profile is paused. When you are no longer pregnant or breastfeeding, reply 1 to update your info.";
+        } else if (donor.eligibility_status === 'eligible' && daysLeft > 0) {
+          restLine = restDays > 0
+            ? `\n\nThank you for your last donation! ❤️ You're on a rest break. You can donate again in ${daysLeft} day(s). We won't send you requests until then.`
+            : `\n\nYou can start donating in ${daysLeft} day(s). We won't send you requests until then.`;
+        }
+        return sendMessage(from, `Welcome back, ${donor.name}! 🩸${restLine}\n\nReply:\n1 - Update my donor info\n2 - Request blood\n3 - Home lab test (coming soon)`);
       }
-      return sendMessage(from, "Welcome to LifeDrop 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood");
+      return sendMessage(from, "Welcome to LifeDrop 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood\n3 - Home lab test (coming soon)");
     }
 
     case 'menu':
@@ -186,6 +246,15 @@ async function handleMessage(from, text) {
       } else if (text === '2') {
         session.step = 'request_blood_type';
         return sendMessage(from, "What blood type is needed? (e.g. A+, O-, B+, AB+)");
+      } else if (text === '3') {
+        return sendButtons(
+          from,
+          "🧪 *Home Lab Tests: coming soon!*\nA trained lab technician will come to your home to collect samples for tests like blood group, blood count and more.\n\nWant us to tell you when it launches?",
+          [
+            { id: 'homelab_notify', title: 'Yes, notify me' },
+            { id: 'homelab_no', title: 'No thanks' }
+          ]
+        );
       } else {
         session.aiAttempts = (session.aiAttempts || 0) + 1;
         if (session.aiAttempts <= 3) {
@@ -269,14 +338,14 @@ async function handleMessage(from, text) {
 
     default:
       sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
-      return sendMessage(from, "Let's start over. Welcome to LifeDrop 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood");
+      return sendMessage(from, "Let's start over. Welcome to LifeDrop 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood\n3 - Home lab test (coming soon)");
   }
 }
 
 // Flow Submission Handler
 async function handleFlowSubmission(from, flowData) {
   try {
-    await saveDonor(from, flowData);
+    const screening = await saveDonor(from, flowData);
 
     const countResult = await pool.query(`SELECT COUNT(*) FROM donors`);
     const totalDonors = countResult.rows[0].count;
@@ -284,10 +353,10 @@ async function handleFlowSubmission(from, flowData) {
     const bloodTypeLabel = flowData.blood_type === 'UNKNOWN' ? "Unknown (Needs Typing)" : flowData.blood_type;
 
     await notifyCustomerService(
-      `🆕 *New Donor Registered!*\n\n👤 *Name:* ${flowData.name}\n📞 *Phone:* ${from}\n🩸 *Blood Group:* ${bloodTypeLabel}\n📍 *City:* ${flowData.city}\n📊 *Total Donors:* ${totalDonors}`
+      `🆕 *New Donor Registered!*\n\n👤 *Name:* ${flowData.name}\n📞 *Phone:* ${from}\n🩸 *Blood Group:* ${bloodTypeLabel}\n📍 *City:* ${flowData.city}\n🩺 *Screening:* ${screening.status}${screening.deferredUntil ? ' (wait until ' + screening.deferredUntil + ')' : ''}\n📊 *Total Donors:* ${totalDonors}`
     );
 
-    await sendMessage(from, "Thank you! You are officially registered as a LifeDrop donor. We'll reach out when a matching patient nearby needs blood. Reminder: LifeDrop does not pay donors. 🩸");
+    await sendMessage(from, screeningReply(screening));
     await sendCommunityLinkIfNeeded(from);
 
     sessions[from] = { step: 'awaiting_feedback', data: { donorName: flowData.name }, aiAttempts: 0 };
@@ -310,20 +379,39 @@ async function saveDonor(phone, d) {
 
   const parsedAge = parseInt(d.age, 10) || null;
   const parsedWeight = parseInt(d.weight_kg, 10) || null;
+  const gender = d.gender === 'male' || d.gender === 'female' ? d.gender : null;
 
-  const isEligible = !onMed && !chronic && !illness && !tattoo && d.blood_type !== 'UNKNOWN';
+  const screening = evaluateScreening(d);
 
   await pool.query(
-    `INSERT INTO donors (name, phone, country, blood_type, city, age, weight_kg, email, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing, consent_given, no_payment_ack, eligibility_status, last_inbound_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+    `INSERT INTO donors (name, phone, country, blood_type, city, age, weight_kg, email, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing, consent_given, no_payment_ack, eligibility_status, gender, deferred_until, screening_reasons, last_inbound_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW())
      ON CONFLICT (phone) DO UPDATE SET
-       name=$1, country=$3, blood_type=$4, city=$5, age=$6, weight_kg=$7, email=$8, on_medication=$9, chronic_condition=$10, recent_illness=$11, recent_tattoo_piercing=$12, consent_given=$13, no_payment_ack=$14, eligibility_status=$15, last_inbound_at=NOW()`,
+       name=$1, country=$3, blood_type=$4, city=$5, age=$6, weight_kg=$7, email=$8, on_medication=$9, chronic_condition=$10, recent_illness=$11, recent_tattoo_piercing=$12, consent_given=$13, no_payment_ack=$14, eligibility_status=$15, gender=COALESCE($16, donors.gender), deferred_until=$17, screening_reasons=$18, last_inbound_at=NOW()`,
     [
       d.name, phone, d.country, d.blood_type, d.city, parsedAge, parsedWeight, email,
       onMed, chronic, illness, tattoo, consent, noPaymentAck,
-      isEligible ? 'eligible' : 'needs_review'
+      screening.status, gender, screening.deferredUntil, screening.reasons.join(',')
     ]
   );
+  return screening;
+}
+
+// Registration reply based on the screening result (no medical reasons are given in chat)
+function screeningReply(screening) {
+  switch (screening.status) {
+    case 'not_eligible':
+      return "Thank you for wanting to help. 🙏 Based on your answers, blood donation is not safe for you or for patients right now, so we will not send you donation requests. You can still help by sharing LifeDrop with friends and family. If you think an answer was wrong, reply 1 to update your info.";
+    case 'needs_update':
+      return "Thank you for registering! 🩸 While you are pregnant or breastfeeding, we will not send you donation requests. When that changes, reply 1 to update your info and you can start donating.";
+    case 'needs_review':
+      return "Thank you! You are registered as a LifeDrop donor. 🩸 Our team will review a few of your answers before we send you requests. Reminder: LifeDrop does not pay donors.";
+    default:
+      if (screening.deferredUntil) {
+        return `Thank you! You are registered as a LifeDrop donor. 🩸 Based on your answers, you need to wait before donating. We'll start sending you requests from ${screening.deferredUntil}. Reminder: LifeDrop does not pay donors.`;
+      }
+      return "Thank you! You are officially registered as a LifeDrop donor. We'll reach out when a matching patient nearby needs blood. Reminder: LifeDrop does not pay donors. 🩸";
+  }
 }
 
 // Community Invite Helper
@@ -352,9 +440,10 @@ async function saveRequestAndMatch(phone, d) {
   const matchedDonors = await pool.query(
     `SELECT id, name, phone, last_inbound_at FROM donors
      WHERE blood_type = $1 AND city ILIKE $2 AND eligibility_status = 'eligible'
-       AND (last_donation_date IS NULL OR last_donation_date <= CURRENT_DATE - $4::int)
+       AND (deferred_until IS NULL OR deferred_until <= CURRENT_DATE)
+       AND (last_donation_date IS NULL OR last_donation_date <= CURRENT_DATE - (CASE WHEN gender = 'male' THEN $4 ELSE $5 END)::int)
      LIMIT $3`,
-    [d.blood_type_needed, `%${d.location}%`, notifyCount, DONATION_WAIT_DAYS]
+    [d.blood_type_needed, `%${d.location}%`, notifyCount, DONATION_WAIT_DAYS_MALE, DONATION_WAIT_DAYS_FEMALE]
   );
 
   if (matchedDonors.rows.length === 0) {
@@ -494,8 +583,8 @@ async function handleDonorResponse(from, buttonId) {
   }
 
   // Donor already gave blood recently (e.g. tapped an older alert): keep them resting
-  const donorRest = await pool.query(`SELECT last_donation_date FROM donors WHERE phone = $1`, [from]);
-  const daysLeft = daysUntilEligible(donorRest.rows[0]?.last_donation_date, DONATION_WAIT_DAYS);
+  const donorRest = await pool.query(`SELECT last_donation_date, gender FROM donors WHERE phone = $1`, [from]);
+  const daysLeft = daysUntilEligible(donorRest.rows[0]?.last_donation_date, donationWaitDays(donorRest.rows[0]?.gender));
   if (daysLeft > 0) {
     await pool.query(`UPDATE matches SET response = 'no' WHERE id = $1`, [matchId]);
     return sendMessage(from, `Thank you for wanting to help! 🙏 You donated recently, so your body needs rest. You can donate again in ${daysLeft} day(s). We'll reach out after that.`);
@@ -513,11 +602,12 @@ async function handleDonorResponse(from, buttonId) {
     return sendMessage(from, "Thanks so much for being ready to help! We have already secured enough donors for this request. We will reach out next time there is a match. 🙏");
   }
 
-  await pool.query(`UPDATE matches SET response = 'yes' WHERE id = $1`, [matchId]);
+  const confirmCode = await generateConfirmCode();
+  await pool.query(`UPDATE matches SET response = 'yes', confirm_code = $2 WHERE id = $1`, [matchId, confirmCode]);
   const donorInfo = await pool.query(`SELECT name FROM donors WHERE phone = $1`, [from]);
   const donorName = donorInfo.rows[0]?.name || 'A donor';
 
-  await sendMessage(from, "Thank you! We've noted your response. The requester's contact will follow shortly so you can coordinate. Reminder: any transport/feeding support is arranged directly between you two. 🙏");
+  await sendMessage(from, `Thank you! We've noted your response. The requester's contact will follow shortly so you can coordinate. Reminder: any transport/feeding support is arranged directly between you two. 🙏\n\n🔑 Your donation code: *${confirmCode}*\nAt the blood bank, show this code and your ID card. The staff will confirm your donation with it.`);
   await sendMessage(
     requester_phone,
     `Good news! ${donorName} (${from}) has agreed to donate ${blood_type_needed}${hospital_name ? ' at ' + hospital_name : ''} in ${location}. Please reach out to coordinate directly.`
@@ -565,12 +655,12 @@ async function handleDonationConfirmation(from, buttonId) {
   const matchId = buttonId.replace('donated_yes_', '').replace('donated_no_', '');
 
   const matchRow = await pool.query(
-    `SELECT m.donor_id, m.donation_confirmed, d.name AS donor_name, d.phone AS donor_phone, r.requester_phone
+    `SELECT m.donor_id, m.donation_confirmed, d.name AS donor_name, d.phone AS donor_phone, d.gender, r.requester_phone
      FROM matches m JOIN donors d ON d.id = m.donor_id JOIN requests r ON r.id = m.request_id WHERE m.id = $1`,
     [matchId]
   );
   if (matchRow.rows.length === 0) return;
-  const { donor_id, donation_confirmed, donor_name, donor_phone, requester_phone } = matchRow.rows[0];
+  const { donor_id, donation_confirmed, donor_name, donor_phone, gender, requester_phone } = matchRow.rows[0];
 
   if (from !== donor_phone && from !== requester_phone) return;
   if (donation_confirmed === true) {
@@ -585,10 +675,9 @@ async function handleDonationConfirmation(from, buttonId) {
     );
   }
 
-  await pool.query(`UPDATE matches SET donation_confirmed = TRUE WHERE id = $1`, [matchId]);
-  await pool.query(`UPDATE donors SET last_donation_date = CURRENT_DATE WHERE id = $1`, [donor_id]);
+  await recordDonation(matchId, donor_id, null);
 
-  const donorThanks = `Thank you for donating blood, ${donor_name}! ❤️ You may have saved a life. Your body needs time to recover, so we won't ask you to donate again for the next ${DONATION_WAIT_DAYS} days. We'll reach out after that.`;
+  const donorThanks = donorThanksText(donor_name, gender);
   if (from === donor_phone) {
     await sendMessage(from, donorThanks);
   } else {
@@ -600,7 +689,114 @@ async function handleDonationConfirmation(from, buttonId) {
     }
   }
   await notifyCustomerService(
-    `✅ *Donation Confirmed*\n\n👤 *Donor:* ${donor_name} (${donor_phone})\n📞 *Requester:* ${requester_phone}\n🆔 *Match ID:* ${matchId}\n⏳ *Next eligible in:* ${DONATION_WAIT_DAYS} days`
+    `✅ *Donation Confirmed (self-reported)*\n\n👤 *Donor:* ${donor_name} (${donor_phone})\n📞 *Requester:* ${requester_phone}\n🆔 *Match ID:* ${matchId}\n⏳ *Next eligible in:* ${donationWaitDays(gender)} days`
+  );
+}
+
+// Marks a match as donated and starts the donor's rest period.
+// With a facilityId the blood bank checked the donor's ID, so the donor also becomes "verified".
+async function recordDonation(matchId, donorId, facilityId) {
+  await pool.query(`UPDATE matches SET donation_confirmed = TRUE, confirmed_by_facility_id = $2 WHERE id = $1`, [matchId, facilityId]);
+  await pool.query(`UPDATE donors SET last_donation_date = CURRENT_DATE WHERE id = $1`, [donorId]);
+  if (facilityId) {
+    await pool.query(`UPDATE donors SET verified_at = NOW(), verified_by_facility_id = $2 WHERE id = $1`, [donorId, facilityId]);
+  }
+}
+
+function donorThanksText(donorName, gender) {
+  return `Thank you for donating blood, ${donorName}! ❤️ You may have saved a life. Your body needs time to recover, so we won't ask you to donate again for the next ${donationWaitDays(gender)} days. We'll reach out after that.`;
+}
+
+// Short code the donor shows at the blood bank, e.g. LD-48213 (unique among open codes)
+async function generateConfirmCode() {
+  for (let i = 0; i < 5; i++) {
+    const code = `LD-${crypto.randomInt(10000, 100000)}`;
+    const clash = await pool.query(`SELECT 1 FROM matches WHERE confirm_code = $1 AND donation_confirmed IS NOT TRUE`, [code]);
+    if (clash.rows.length === 0) return code;
+  }
+  return `LD-${Date.now().toString().slice(-7)}`;
+}
+
+async function getPartnerFacility(phone) {
+  const result = await pool.query(
+    `SELECT id, name FROM facilities WHERE is_partner = TRUE AND regexp_replace(staff_phone, '\\D', '', 'g') = $1 LIMIT 1`,
+    [phone]
+  );
+  return result.rows[0] || null;
+}
+
+// Blood bank staff send the donor's code: show who it belongs to so they can check the ID card first
+async function handleFacilityCode(from, text) {
+  const facility = await getPartnerFacility(from);
+  if (!facility) {
+    return sendMessage(from, "This code is for partner blood bank staff. Please show it to the staff at the blood bank when you donate. 🩸");
+  }
+
+  const code = `LD-${text.replace(/\D/g, '')}`;
+  const matchRow = await pool.query(
+    `SELECT m.id, m.donation_confirmed, d.name, d.blood_type, d.phone
+     FROM matches m JOIN donors d ON d.id = m.donor_id
+     WHERE m.confirm_code = $1 AND m.response = 'yes' ORDER BY m.id DESC LIMIT 1`,
+    [code]
+  );
+  if (matchRow.rows.length === 0) {
+    return sendMessage(from, `❓ Code ${code} was not found. Please check it with the donor and send it again.`);
+  }
+  const match = matchRow.rows[0];
+  if (match.donation_confirmed === true) {
+    return sendMessage(from, `Code ${code} is already confirmed. Thank you! 🙏`);
+  }
+
+  return sendButtons(
+    from,
+    `🔎 *${code}*\n👤 ${match.name}\n🩸 ${match.blood_type}\n📞 ...${match.phone.slice(-4)}\n\nPlease check the donor's ID card matches this name. Did this person donate today?`,
+    [
+      { id: `fac_yes_${match.id}`, title: 'Confirm donation' },
+      { id: `fac_no_${match.id}`, title: 'Did not donate' }
+    ]
+  );
+}
+
+async function handleFacilityConfirmation(from, buttonId) {
+  const facility = await getPartnerFacility(from);
+  if (!facility) return;
+
+  const isYes = buttonId.startsWith('fac_yes_');
+  const matchId = buttonId.replace('fac_yes_', '').replace('fac_no_', '');
+
+  const matchRow = await pool.query(
+    `SELECT m.donor_id, m.donation_confirmed, m.confirm_code, d.name, d.phone, d.gender, r.requester_phone
+     FROM matches m JOIN donors d ON d.id = m.donor_id JOIN requests r ON r.id = m.request_id WHERE m.id = $1`,
+    [matchId]
+  );
+  if (matchRow.rows.length === 0) return;
+  const { donor_id, donation_confirmed, confirm_code, name, phone, gender, requester_phone } = matchRow.rows[0];
+  if (donation_confirmed === true) {
+    return sendMessage(from, `Code ${confirm_code} is already confirmed. Thank you! 🙏`);
+  }
+
+  if (!isYes) {
+    await sendMessage(from, "Noted. Nothing was recorded for this donor.");
+    return notifyCustomerService(
+      `⚠️ *Blood Bank: Donation Not Done*\n\n🏥 *Facility:* ${facility.name}\n👤 *Donor:* ${name} (${phone})\n🔑 *Code:* ${confirm_code}`
+    );
+  }
+
+  await recordDonation(matchId, donor_id, facility.id);
+  await sendMessage(from, `✅ Donation by ${name} (${confirm_code}) is recorded. Thank you, ${facility.name}! 🙏`);
+
+  for (const [to, text] of [
+    [phone, `${donorThanksText(name, gender)}\n\n✅ ${facility.name} confirmed your donation. You are now a *verified* LifeDrop donor.`],
+    [requester_phone, `✅ ${facility.name} has confirmed that ${name} donated blood. Wishing the patient a quick recovery. 🙏`]
+  ]) {
+    try {
+      await sendMessage(to, text);
+    } catch (err) {
+      console.warn('Could not send facility confirmation notice (likely outside 24h window):', err.response?.data?.error?.message || err.message);
+    }
+  }
+  await notifyCustomerService(
+    `✅ *Donation Confirmed by Blood Bank*\n\n🏥 *Facility:* ${facility.name}\n👤 *Donor:* ${name} (${phone})\n🔑 *Code:* ${confirm_code}\n⏳ *Next eligible in:* ${donationWaitDays(gender)} days`
   );
 }
 
