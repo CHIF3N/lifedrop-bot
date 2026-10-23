@@ -289,7 +289,7 @@ async function getStats(days) {
       since
     ),
     pool.query(
-      `SELECT lower(trim(city)) AS city, COUNT(*) AS count, COUNT(*) FILTER (WHERE ${READY_SQL}) AS ready
+      `SELECT COALESCE(town, lower(trim(city))) AS city, COUNT(*) AS count, COUNT(*) FILTER (WHERE ${READY_SQL}) AS ready
        FROM donors GROUP BY 1 ORDER BY 2 DESC LIMIT 8`
     ),
     pool.query(`SELECT blood_type, COUNT(*) AS count FROM donors WHERE ${READY_SQL} GROUP BY 1`),
@@ -312,7 +312,7 @@ async function getStats(days) {
       since
     ),
     pool.query(
-      `SELECT lower(trim(location)) AS location, COUNT(*) AS count FROM requests
+      `SELECT COALESCE(town, lower(trim(location))) AS location, COUNT(*) AS count FROM requests
        WHERE ${recent} GROUP BY 1 ORDER BY 2 DESC LIMIT 5`,
       since
     ),
@@ -678,18 +678,22 @@ function askBloodGroup(from, session, prefix = '') {
   ]);
 }
 
-// Partner hospitals near the patient as a list (8 max + other/skip); otherwise the name is typed
+// Partner hospitals near the patient as a list (8 max + other/skip); otherwise the name is typed.
+// Near = same clean town name, or within 30 km of the pin (or of the town centre) when the hospital has coordinates.
 async function askHospital(from, session, intro) {
   session.step = 'request_hospital';
-  const hasPin = session.data.lat != null && session.data.lng != null;
+  const townCentre = session.data.town ? geo.townByName(session.data.town) : null;
+  const point = session.data.lat != null && session.data.lng != null
+    ? { lat: session.data.lat, lng: session.data.lng }
+    : townCentre;
   const partners = await pool.query(
     `SELECT id, name, city FROM facilities
      WHERE is_partner = TRUE AND does_blood_collection = TRUE AND is_demo IS NOT TRUE
-       AND (city ILIKE $1 OR $1 ILIKE '%' || city || '%'
-            ${hasPin ? `OR (latitude IS NOT NULL AND ${geo.distanceSql('$2', '$3', 'latitude', 'longitude')} <= 30)` : ''})
-     ORDER BY name LIMIT 8`,
-    hasPin
-      ? [session.data.town || session.data.location || '', session.data.lat, session.data.lng]
+       AND (lower(trim(city)) = lower(trim($1))
+            ${point ? `OR (latitude IS NOT NULL AND ${geo.distanceSql('$2', '$3', 'latitude', 'longitude')} <= 30)` : ''})
+     ORDER BY lower(trim(city)) = lower(trim($1)) DESC, name LIMIT 8`,
+    point
+      ? [session.data.town || session.data.location || '', point.lat, point.lng]
       : [session.data.town || session.data.location || '']
   );
   if (partners.rows.length === 0) {
@@ -1368,11 +1372,17 @@ async function handleAdminCommand(from, command) {
         await pool.query(`UPDATE facilities SET is_partner = TRUE WHERE id = $1`, [existing.rows[0].id]);
         return sendMessage(from, `ℹ️ ${f.staff_phone} is already registered as *${existing.rows[0].name}* (ID ${existing.rows[0].id}). It is now active as a partner.`);
       }
+      // Store the clean town name ("Molyko" -> Buea) and its centre, so requests in nearby towns find this hospital
+      const town = geo.resolveTown(f.city).town;
+      const typedCity = f.city;
+      f.city = town?.name || f.city;
       const inserted = await pool.query(
-        `INSERT INTO facilities (name, type, city, staff_phone, is_partner, does_blood_collection, does_lab_tests)
-         VALUES ($1, $2, $3, $4, TRUE, $5, $6) RETURNING id`,
-        [f.name, f.type, f.city, f.staff_phone, f.does_blood_collection, f.does_lab_tests]
+        `INSERT INTO facilities (name, type, city, staff_phone, is_partner, does_blood_collection, does_lab_tests, latitude, longitude)
+         VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $8) RETURNING id`,
+        [f.name, f.type, f.city, f.staff_phone, f.does_blood_collection, f.does_lab_tests, town?.lat ?? null, town?.lng ?? null]
       );
+      if (town && town.name !== typedCity) f.city = `${town.name} (you typed "${typedCity}")`;
+      if (!town) f.city = `${typedCity} ⚠️ not a known town: requests will only match this exact name`;
       const id = inserted.rows[0].id;
       const welcome = await sendToFacility(
         { id, name: f.name, staff_phone: f.staff_phone },
