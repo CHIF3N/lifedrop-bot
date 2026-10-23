@@ -43,6 +43,17 @@ VALUES ('Lab name', 'lab', 'Buea', 'South-West', 4.1527, 9.2410, '2376XXXXXXXX',
 ### New settings (all optional)
 - `SLOT_CAPACITY` — people per lab per time slot (default 3).
 - `SEED_DEMO_LABS` — `true` adds the fictional demo labs. Test numbers only.
+- `REQUIRE_CONFIRMED_DONORS` — `true` turns on the confirmed-donor rule below. Default off.
+
+### Confirmed donors only (`REQUIRE_CONFIRMED_DONORS=true`)
+- Every booking gets a code like **LT-48213**. The donor shows it at the lab.
+- Lab staff send the code from their partner WhatsApp number, check the ID card, and type the blood group.
+  The donor is then confirmed (`donors.verified_at`), and the lab's blood group replaces the one they typed.
+  A donation confirmed with an LD code also counts as confirmed.
+- With the rule on, **Routine** and **Urgent** requests only go to confirmed donors.
+- **Emergencies** go to everyone, confirmed donors first. Unconfirmed donors are told the hospital will test their blood first.
+- Unconfirmed donors are reminded to book: at the end of sign-up, when they tap "Not now", and in "Welcome back".
+- Only switch it on once partner labs exist in your main towns. Otherwise almost nobody gets normal requests.
 
 ### Known limits
 - Slot times are the same for every lab (09:00 / 11:00 / 14:00). They don't read each lab's `hours` yet.
