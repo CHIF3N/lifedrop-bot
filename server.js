@@ -11,6 +11,7 @@ const { parseResultsRequest, normalizeBloodGroup, parseResultButton, neutralResu
 const { formatTime, toTemplateParam, splitReport, formatStatsReport, dailySummaryParams } = require('./reports');
 const { normalizePhone, parseAdminCommand, HELP_TEXT } = require('./admin');
 const { BLOOD_GROUP_ROWS, REQUEST_REASONS, reasonTitle, requestSummary, parseContact } = require('./request-form');
+const { createDashboard, isStopText, isStartText, STOP_PAYLOAD } = require('./dashboard');
 
 const app = express();
 app.use(bodyParser.json());
@@ -196,6 +197,10 @@ app.post('/webhook', async (req, res) => {
         const adminCommand = isAdmin(from) ? parseAdminCommand(text) : null;
         if (adminCommand) {
           await handleAdminCommand(from, adminCommand);
+        } else if (isStopText(text)) {
+          await dashboard.handleOptOut(from);
+        } else if (isStartText(text) && await dashboard.handleOptIn(from)) {
+          // Opted back in to broadcasts
         } else if (resultsCode) {
           await handleResultsRequest(from, resultsCode);
         } else if (/^LD-?\s?\d{5}$/i.test(text)) {
@@ -233,6 +238,8 @@ async function handleButton(from, buttonId) {
     await handleLabCodeButton(from, buttonId);
   } else if (buttonId.startsWith('appt_')) {
     await handleAppointmentButton(from, buttonId);
+  } else if (buttonId === STOP_PAYLOAD) {
+    await dashboard.handleOptOut(from);
   } else {
     await handleMessage(from, buttonId);
   }
@@ -2141,6 +2148,10 @@ async function sendList(to, headerText, bodyText, buttonText, sections) {
     { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
+
+// Admin web dashboard at /admin (needs ADMIN_KEY)
+const dashboard = createDashboard({ pool, getStats, sendMessage, sendTemplate });
+app.use('/admin', dashboard.router);
 
 app.get('/', (req, res) => res.send('LifeDrop bot is running.'));
 const PORT = process.env.PORT || 3000;
