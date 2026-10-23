@@ -20,6 +20,8 @@ const DONATION_WAIT_DAYS = parseInt(process.env.DONATION_WAIT_DAYS, 10) || 90; /
 const COMMUNITY_LINK ='https://chat.whatsapp.com/EPIAr0zFQxVEYXru4PmRwF?s=cl&p=a&mlu=4&ilr=4';
 const SLOT_CAPACITY = parseInt(process.env.SLOT_CAPACITY, 10) || 3; // Max bookings per lab per time slot
 const SEED_DEMO_LABS = process.env.SEED_DEMO_LABS === 'true'; // Test numbers only: adds FICTIONAL labs
+// Facilities (shared table) that donors can book a free test at
+const BOOKABLE_LAB = `is_partner AND does_lab_tests`;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -42,28 +44,33 @@ async function initDb() {
       ALTER TABLE donors ADD COLUMN IF NOT EXISTS location_updated_at TIMESTAMP;
       ALTER TABLE requests ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
       ALTER TABLE requests ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
-      CREATE TABLE IF NOT EXISTS partner_labs (
+      CREATE TABLE IF NOT EXISTS facilities (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
-        town TEXT NOT NULL,
-        lat DOUBLE PRECISION,
-        lng DOUBLE PRECISION,
-        phone TEXT,
-        hours TEXT,
-        active BOOLEAN DEFAULT TRUE,
-        is_demo BOOLEAN DEFAULT FALSE,
+        type TEXT NOT NULL DEFAULT 'hospital',
+        city TEXT,
+        region TEXT,
+        address TEXT,
+        latitude DOUBLE PRECISION,
+        longitude DOUBLE PRECISION,
+        staff_phone TEXT,
+        is_partner BOOLEAN DEFAULT FALSE,
+        does_blood_collection BOOLEAN DEFAULT FALSE,
+        does_lab_tests BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW()
       );
+      ALTER TABLE facilities ADD COLUMN IF NOT EXISTS hours TEXT;
+      ALTER TABLE facilities ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT FALSE;
       CREATE TABLE IF NOT EXISTS appointments (
         id SERIAL PRIMARY KEY,
         donor_phone TEXT NOT NULL,
-        lab_id INTEGER NOT NULL REFERENCES partner_labs(id),
+        facility_id INTEGER NOT NULL REFERENCES facilities(id),
         slot_at TIMESTAMPTZ NOT NULL,
         status TEXT DEFAULT 'booked',
         reminder_sent BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW()
       );
-      CREATE INDEX IF NOT EXISTS appointments_slot_idx ON appointments (lab_id, slot_at);
+      CREATE INDEX IF NOT EXISTS appointments_slot_idx ON appointments (facility_id, slot_at);
     `);
     if (SEED_DEMO_LABS) await seedDemoLabs();
     console.log('✅ Database schema verified.');
@@ -76,13 +83,13 @@ initDb();
 // FICTIONAL labs for testing the booking flow on a test number. These are NOT real partners.
 // Only runs when SEED_DEMO_LABS=true; never set that on the live bot.
 async function seedDemoLabs() {
-  const existing = await pool.query(`SELECT 1 FROM partner_labs WHERE is_demo LIMIT 1`);
+  const existing = await pool.query(`SELECT 1 FROM facilities WHERE is_demo LIMIT 1`);
   if (existing.rows.length > 0) return;
   await pool.query(`
-    INSERT INTO partner_labs (name, town, lat, lng, phone, hours, is_demo) VALUES
-      ('DEMO Lab Buea (fictional)', 'Buea', 4.1560, 9.2440, '000000001', 'Mon-Sat 08:00-16:00', TRUE),
-      ('DEMO Lab Limbe (fictional)', 'Limbe', 4.0190, 9.2050, '000000002', 'Mon-Fri 08:00-15:00', TRUE),
-      ('DEMO Lab Tiko (fictional)', 'Tiko', 4.0760, 9.3610, '000000003', 'Mon-Sat 09:00-14:00', TRUE)
+    INSERT INTO facilities (name, type, city, region, latitude, longitude, hours, is_partner, does_lab_tests, is_demo) VALUES
+      ('DEMO Lab Buea (fictional)', 'lab', 'Buea', 'South-West', 4.1560, 9.2440, 'Mon-Sat 08:00-16:00', TRUE, TRUE, TRUE),
+      ('DEMO Lab Limbe (fictional)', 'lab', 'Limbe', 'South-West', 4.0190, 9.2050, 'Mon-Fri 08:00-15:00', TRUE, TRUE, TRUE),
+      ('DEMO Lab Tiko (fictional)', 'lab', 'Tiko', 'South-West', 4.0760, 9.3610, 'Mon-Sat 09:00-14:00', TRUE, TRUE, TRUE)
   `);
   console.log('🧪 Seeded FICTIONAL demo labs (SEED_DEMO_LABS=true).');
 }
@@ -802,13 +809,13 @@ async function offerLabs(from) {
   const labs = point
     ? await pool.query(
         `SELECT * FROM (
-           SELECT id, name, town, hours, ${geo.distanceSql('$1', '$2')} AS dist_km
-           FROM partner_labs WHERE active AND lat IS NOT NULL AND lng IS NOT NULL
+           SELECT id, name, city AS town, hours, ${geo.distanceSql('$1', '$2', 'latitude', 'longitude')} AS dist_km
+           FROM facilities WHERE ${BOOKABLE_LAB} AND latitude IS NOT NULL AND longitude IS NOT NULL
          ) l WHERE dist_km <= $3 ORDER BY dist_km LIMIT 3`,
         [point.lat, point.lng, geo.MAX_RADIUS_KM]
       )
     : await pool.query(
-        `SELECT id, name, town, hours, NULL::float AS dist_km FROM partner_labs WHERE active AND town ILIKE $1 LIMIT 3`,
+        `SELECT id, name, city AS town, hours, NULL::float AS dist_km FROM facilities WHERE ${BOOKABLE_LAB} AND city ILIKE $1 LIMIT 3`,
         [`%${donor.city || ''}%`]
       );
 
@@ -833,14 +840,14 @@ async function offerLabs(from) {
 
 // Free time slots at one lab (next 3 working days), as a WhatsApp list
 async function sendLabSlots(from, labId) {
-  const labRow = await pool.query(`SELECT id, name FROM partner_labs WHERE id = $1 AND active`, [labId]);
+  const labRow = await pool.query(`SELECT id, name FROM facilities WHERE id = $1 AND ${BOOKABLE_LAB}`, [labId]);
   const lab = labRow.rows[0];
   if (!lab) return sendMessage(from, "Sorry, that lab is not available any more. Reply *test* to see other labs.");
 
   const slots = upcomingSlots(new Date());
   const taken = await pool.query(
     `SELECT slot_at, COUNT(*)::int AS n FROM appointments
-     WHERE lab_id = $1 AND status = 'booked' AND slot_at = ANY($2::timestamptz[]) GROUP BY slot_at`,
+     WHERE facility_id = $1 AND status = 'booked' AND slot_at = ANY($2::timestamptz[]) GROUP BY slot_at`,
     [lab.id, slots.map(s => s.toISOString())]
   );
   const full = new Set(taken.rows.filter(r => r.n >= SLOT_CAPACITY).map(r => new Date(r.slot_at).getTime()));
@@ -859,12 +866,12 @@ async function bookSlot(from, slot) {
   if (!slot || slot.slotAt.getTime() <= Date.now()) {
     return sendMessage(from, "Sorry, that time has passed. Reply *test* to pick a new time.");
   }
-  const labRow = await pool.query(`SELECT id, name, town, phone, hours, is_demo FROM partner_labs WHERE id = $1 AND active`, [slot.labId]);
+  const labRow = await pool.query(`SELECT id, name, city AS town, hours, is_demo FROM facilities WHERE id = $1 AND ${BOOKABLE_LAB}`, [slot.labId]);
   const lab = labRow.rows[0];
   if (!lab) return sendMessage(from, "Sorry, that lab is not available any more. Reply *test* to see other labs.");
 
   const existing = await pool.query(
-    `SELECT a.id, a.slot_at, l.name FROM appointments a JOIN partner_labs l ON l.id = a.lab_id
+    `SELECT a.id, a.slot_at, l.name FROM appointments a JOIN facilities l ON l.id = a.facility_id
      WHERE a.donor_phone = $1 AND a.status = 'booked' AND a.slot_at > NOW() LIMIT 1`,
     [from]
   );
@@ -876,7 +883,7 @@ async function bookSlot(from, slot) {
   }
 
   const count = await pool.query(
-    `SELECT COUNT(*)::int AS n FROM appointments WHERE lab_id = $1 AND slot_at = $2 AND status = 'booked'`,
+    `SELECT COUNT(*)::int AS n FROM appointments WHERE facility_id = $1 AND slot_at = $2 AND status = 'booked'`,
     [lab.id, slot.slotAt]
   );
   if (count.rows[0].n >= SLOT_CAPACITY) {
@@ -887,7 +894,7 @@ async function bookSlot(from, slot) {
   // Booked less than a day ahead: this confirmation is the reminder
   const remindLater = slot.slotAt.getTime() - Date.now() > 24 * 60 * 60 * 1000;
   const inserted = await pool.query(
-    `INSERT INTO appointments (donor_phone, lab_id, slot_at, reminder_sent) VALUES ($1, $2, $3, $4) RETURNING id`,
+    `INSERT INTO appointments (donor_phone, facility_id, slot_at, reminder_sent) VALUES ($1, $2, $3, $4) RETURNING id`,
     [from, lab.id, slot.slotAt, !remindLater]
   );
   const apptId = inserted.rows[0].id;
@@ -895,7 +902,7 @@ async function bookSlot(from, slot) {
   const demoLine = lab.is_demo ? '\n\n⚠️ This is a DEMO lab for testing. It is not a real clinic.' : '';
   await sendButtons(
     from,
-    `✅ Booked! Free blood test\n🏥 ${lab.name}, ${lab.town}\n🕘 ${formatSlot(slot.slotAt)}${lab.phone ? `\n📞 ${lab.phone}` : ''}${lab.hours ? `\n⏰ Open ${lab.hours}` : ''}\n\nPlease bring an ID card.${remindLater ? " We'll remind you the day before." : ''}${demoLine}`,
+    `✅ Booked! Free blood test\n🏥 ${lab.name}, ${lab.town || ''}\n🕘 ${formatSlot(slot.slotAt)}${lab.hours ? `\n⏰ Open ${lab.hours}` : ''}\n\nPlease bring an ID card.${remindLater ? " We'll remind you the day before." : ''}${demoLine}`,
     [{ id: `appt_cancel_${apptId}`, title: 'Cancel booking' }]
   );
   await notifyCustomerService(`🧪 *Free Test Booked*\n\n📞 *Donor:* ${from}\n🏥 *Lab:* ${lab.name}${lab.is_demo ? ' (DEMO)' : ''}\n🕘 *Time:* ${formatSlot(slot.slotAt)}\n🆔 *Appointment ID:* ${apptId}`);
@@ -907,7 +914,7 @@ async function handleAppointmentButton(from, buttonId) {
   const isCancel = buttonId.startsWith('appt_cancel_');
   const apptId = buttonId.replace('appt_cancel_', '').replace('appt_yes_', '');
   const row = await pool.query(
-    `SELECT a.id, a.status, a.slot_at, l.name FROM appointments a JOIN partner_labs l ON l.id = a.lab_id
+    `SELECT a.id, a.status, a.slot_at, l.name FROM appointments a JOIN facilities l ON l.id = a.facility_id
      WHERE a.id = $1 AND a.donor_phone = $2`,
     [apptId, from]
   );
@@ -930,7 +937,7 @@ async function sendAppointmentReminders() {
   try {
     const due = await pool.query(
       `SELECT a.id, a.donor_phone, a.slot_at, l.name AS lab_name, d.name AS donor_name, d.last_inbound_at
-       FROM appointments a JOIN partner_labs l ON l.id = a.lab_id LEFT JOIN donors d ON d.phone = a.donor_phone
+       FROM appointments a JOIN facilities l ON l.id = a.facility_id LEFT JOIN donors d ON d.phone = a.donor_phone
        WHERE a.status = 'booked' AND a.reminder_sent = FALSE AND a.slot_at > NOW() AND a.slot_at <= NOW() + INTERVAL '24 hours'`
     );
     for (const appt of due.rows) {

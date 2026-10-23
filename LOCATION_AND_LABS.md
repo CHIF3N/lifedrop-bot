@@ -14,9 +14,11 @@
 - Known town centres live in `geo.js` (approximate public coordinates). Add towns there.
 
 ## 3. Partner labs + free test booking
-- Tables: `partner_labs` (name, town, lat, lng, phone, hours, active, is_demo) and `appointments`.
+- Labs live in the shared `facilities` table (same one used for hospitals). A donor can book at a facility with
+  `is_partner = TRUE` and `does_lab_tests = TRUE`. This branch adds `facilities.hours` and `facilities.is_demo`.
+- Bookings go in `appointments` (`facility_id`, `slot_at`, `status`, `reminder_sent`).
 - After registration the donor is offered a free blood test. "Don't know" blood group donors get the lab list straight away.
-- The bot shows the 3 closest active labs (within 50 km of their pin, or in their town), then free slots
+- The bot shows the 3 closest partner labs (within 50 km of their pin, or in their town), then free slots
   (next 3 working days, 09:00 / 11:00 / 14:00 Cameroon time, max `SLOT_CAPACITY` people per slot, default 3).
 - Donors can also reply `test` at any time to book.
 
@@ -25,8 +27,8 @@
 Only use it on a test number. Never set it on the live bot. Add real partner labs with SQL once agreements exist:
 
 ```sql
-INSERT INTO partner_labs (name, town, lat, lng, phone, hours)
-VALUES ('Lab name', 'Buea', 4.1527, 9.2410, '2376XXXXXXXX', 'Mon-Sat 08:00-16:00');
+INSERT INTO facilities (name, type, city, region, latitude, longitude, staff_phone, hours, is_partner, does_lab_tests)
+VALUES ('Lab name', 'lab', 'Buea', 'South-West', 4.1527, 9.2410, '2376XXXXXXXX', 'Mon-Sat 08:00-16:00', TRUE, TRUE);
 ```
 
 ### New settings (all optional)
