@@ -2153,6 +2153,9 @@ async function sendList(to, headerText, bodyText, buttonText, sections) {
 const dashboard = createDashboard({ pool, getStats, sendMessage, sendTemplate });
 app.use('/admin', dashboard.router);
 
+// Short link to the donor community (WhatsApp template buttons can't link to WhatsApp directly)
+app.get('/join', (req, res) => res.redirect(302, COMMUNITY_LINK));
+
 app.get('/', (req, res) => res.send('LifeDrop bot is running.'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
