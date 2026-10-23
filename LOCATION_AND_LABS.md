@@ -9,9 +9,18 @@
 ## 2. Matching by distance
 - With a pin (or a typed town the bot knows), donors are picked **nearest first, up to 50 km**
   (rings: 15 km → 30 km → 50 km). So Buea, Mutengene, Tiko and Limbe help each other.
-- Donors **without** a pin still match by city text, using every known town inside 50 km.
+- Donors **without** a pin match by their clean town (`donors.town`), using every known town inside 50 km.
 - If the request has no pin and an unknown town, matching is the old `city ILIKE` text match.
-- Known town centres live in `geo.js` (approximate public coordinates). Add towns there.
+
+### Typed places: typos and neighbourhoods
+- Typed text is cleaned to a known town: "Douela" → Douala, "Yaunde" → Yaounde, "Molyko" → Buea,
+  "Bonaberi" → Douala, "Up Station" → Bamenda. Accents, case, spaces and hyphens don't matter.
+- Typos allowed: 1 letter for town names of 4–6 letters, 2 for longer. Neighbourhoods need 6+ letters before a typo is allowed.
+- The clean name is saved as `donors.town` and `requests.town`. Old donors are filled in on startup.
+- Not sure (e.g. "Mile 4" is in Limbe and Bamenda)? The bot asks **"Did you mean…?"** with buttons.
+- Not found at all? Requesters get a **Send location** button. If the second answer is still unknown, the
+  request goes ahead with the old text match, so a blood request is never blocked.
+- Towns, other names and neighbourhoods are in `towns.js`. To add a neighbourhood, add it to that town's `areas`.
 
 ## 3. Partner labs + free test booking
 - Labs live in the shared `facilities` table (same one used for hospitals). A donor can book at a facility with
