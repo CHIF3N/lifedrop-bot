@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const { daysUntilEligible } = require('./deferral');
 const { evaluateScreening } = require('./screening');
+const { parseResultsRequest, normalizeBloodGroup, parseResultButton, neutralResultMessage } = require('./results');
 
 const app = express();
 app.use(bodyParser.json());
@@ -45,6 +46,10 @@ async function initDb() {
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS donation_confirmed BOOLEAN;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS confirm_code TEXT;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS confirmed_by_facility_id INTEGER;
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_blood_group TEXT;
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_outcome TEXT;
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS results_at TIMESTAMP;
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS results_facility_id INTEGER;
       CREATE TABLE IF NOT EXISTS facilities (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
@@ -111,6 +116,8 @@ app.post('/webhook', async (req, res) => {
           await handleDonationConfirmation(from, buttonId);
         } else if (buttonId.startsWith('fac_')) {
           await handleFacilityConfirmation(from, buttonId);
+        } else if (buttonId.startsWith('res_')) {
+          await handleResultButton(from, buttonId);
         } else {
           await handleMessage(from, buttonId);
         }
@@ -122,12 +129,17 @@ app.post('/webhook', async (req, res) => {
           await handleRequesterFollowUp(from, payload);
         } else if (payload.startsWith('donated_')) {
           await handleDonationConfirmation(from, payload);
+        } else if (payload.startsWith('res_')) {
+          await handleResultButton(from, payload);
         } else {
           await handleMessage(from, payload);
         }
       } else {
         const text = message.text?.body?.trim() || '';
-        if (/^LD-?\s?\d{5}$/i.test(text)) {
+        const resultsCode = parseResultsRequest(text);
+        if (resultsCode) {
+          await handleResultsRequest(from, resultsCode);
+        } else if (/^LD-?\s?\d{5}$/i.test(text)) {
           await handleFacilityCode(from, text);
         } else {
           await handleMessage(from, text);
@@ -188,6 +200,11 @@ async function handleMessage(from, text) {
   if (text.toLowerCase() === 'restart') {
     sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
     return sendMessage(from, "Restarted. Welcome to LifeDrop! 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood\n3 - Home lab test (coming soon)");
+  }
+
+  // Blood bank staff typing the blood group for a results entry
+  if (session.step === 'results_blood_group') {
+    return handleResultsBloodGroup(from, text);
   }
 
   // Home lab test waitlist (feature coming soon)
@@ -387,7 +404,7 @@ async function saveDonor(phone, d) {
     `INSERT INTO donors (name, phone, country, blood_type, city, age, weight_kg, email, on_medication, chronic_condition, recent_illness, recent_tattoo_piercing, consent_given, no_payment_ack, eligibility_status, gender, deferred_until, screening_reasons, last_inbound_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW())
      ON CONFLICT (phone) DO UPDATE SET
-       name=$1, country=$3, blood_type=$4, city=$5, age=$6, weight_kg=$7, email=$8, on_medication=$9, chronic_condition=$10, recent_illness=$11, recent_tattoo_piercing=$12, consent_given=$13, no_payment_ack=$14, eligibility_status=$15, gender=COALESCE($16, donors.gender), deferred_until=$17, screening_reasons=$18, last_inbound_at=NOW()`,
+       name=$1, country=$3, blood_type=$4, city=$5, age=$6, weight_kg=$7, email=$8, on_medication=$9, chronic_condition=$10, recent_illness=$11, recent_tattoo_piercing=$12, consent_given=$13, no_payment_ack=$14, eligibility_status=CASE WHEN donors.eligibility_status = 'on_hold' THEN 'on_hold' ELSE $15 END, gender=COALESCE($16, donors.gender), deferred_until=$17, screening_reasons=$18, last_inbound_at=NOW()`,
     [
       d.name, phone, d.country, d.blood_type, d.city, parsedAge, parsedWeight, email,
       onMed, chronic, illness, tattoo, consent, noPaymentAck,
@@ -797,6 +814,173 @@ async function handleFacilityConfirmation(from, buttonId) {
   }
   await notifyCustomerService(
     `✅ *Donation Confirmed by Blood Bank*\n\n🏥 *Facility:* ${facility.name}\n👤 *Donor:* ${name} (${phone})\n🔑 *Code:* ${confirm_code}\n⏳ *Next eligible in:* ${donationWaitDays(gender)} days`
+  );
+}
+
+// Donation results, step 1: staff send "results LD-48213" for a confirmed donation
+async function handleResultsRequest(from, code) {
+  const facility = await getPartnerFacility(from);
+  if (!facility) {
+    return sendMessage(from, "Donation results can only be entered by partner blood bank staff. If you donated, the blood bank will share your results with you. 🩸");
+  }
+
+  const matchRow = await pool.query(
+    `SELECT m.id, m.results_at, d.name FROM matches m JOIN donors d ON d.id = m.donor_id
+     WHERE m.confirm_code = $1 AND m.donation_confirmed = TRUE ORDER BY m.id DESC LIMIT 1`,
+    [code]
+  );
+  if (matchRow.rows.length === 0) {
+    return sendMessage(from, `❓ No confirmed donation found for ${code}. If the donor gave blood today, first send the code alone (${code}) to confirm the donation.`);
+  }
+  const match = matchRow.rows[0];
+  if (match.results_at) {
+    return sendMessage(from, `Results for ${code} are already recorded. To correct them, please contact the LifeDrop team.`);
+  }
+
+  sessions[from] = { step: 'results_blood_group', data: { matchId: match.id, code }, aiAttempts: 0 };
+  return sendMessage(from, `🧪 Results for *${code}* (${match.name}).\n\nType the blood group you found, e.g. O+ or AB-.\n\n⚠️ Do NOT type infection test results here. Reply 'cancel' to stop.`);
+}
+
+// Step 2: staff type the blood group, then pick the outcome
+async function handleResultsBloodGroup(from, text) {
+  const { matchId, code } = sessions[from].data;
+  if (text.toLowerCase() === 'cancel') {
+    sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
+    return sendMessage(from, "Cancelled. Nothing was saved.");
+  }
+
+  const bloodGroup = normalizeBloodGroup(text);
+  if (!bloodGroup) {
+    return sendMessage(from, "Please type a blood group like O+, A-, B+ or AB-, or reply 'cancel'.");
+  }
+
+  sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
+  return sendButtons(
+    from,
+    `🧪 *${code}*\n🩸 Blood group: *${bloodGroup}*\n\nScreening outcome?\n• *Cleared*: nothing needs the donor's attention\n• *Needs follow-up*: your team will contact the donor in person\n\nThe donor gets the same message either way.`,
+    [
+      { id: `res_clear_${matchId}_${bloodGroup}`, title: 'Cleared' },
+      { id: `res_follow_${matchId}_${bloodGroup}`, title: 'Needs follow-up' },
+      { id: `res_cancel_${matchId}`, title: 'Cancel' }
+    ]
+  );
+}
+
+// Step 3 (staff outcome buttons) and the donor's "View update" template button
+async function handleResultButton(from, buttonId) {
+  const parsed = parseResultButton(buttonId);
+  if (!parsed) return;
+  const { action, matchId, bloodGroup } = parsed;
+
+  if (action === 'view') {
+    const view = await pool.query(
+      `SELECT m.confirm_code, m.result_blood_group, m.results_at, d.name, d.phone, f.name AS facility_name
+       FROM matches m JOIN donors d ON d.id = m.donor_id LEFT JOIN facilities f ON f.id = m.results_facility_id WHERE m.id = $1`,
+      [matchId]
+    );
+    const row = view.rows[0];
+    if (!row || row.phone !== from || !row.results_at) return;
+    return sendMessage(from, neutralResultMessage(row.name, row.confirm_code, row.result_blood_group, row.facility_name));
+  }
+
+  const facility = await getPartnerFacility(from);
+  if (!facility) return;
+  if (action === 'cancel') {
+    return sendMessage(from, "Cancelled. Nothing was saved.");
+  }
+  if (!bloodGroup) return;
+
+  const matchRow = await pool.query(
+    `SELECT m.confirm_code, m.results_at, d.id AS donor_id, d.name, d.phone, d.blood_type, d.eligibility_status, d.screening_reasons, d.last_inbound_at
+     FROM matches m JOIN donors d ON d.id = m.donor_id WHERE m.id = $1 AND m.donation_confirmed = TRUE`,
+    [matchId]
+  );
+  if (matchRow.rows.length === 0) return;
+  const donor = matchRow.rows[0];
+  if (donor.results_at) {
+    return sendMessage(from, `Results for ${donor.confirm_code} are already recorded. To correct them, please contact the LifeDrop team.`);
+  }
+
+  const followUp = action === 'follow';
+  await pool.query(
+    `UPDATE matches SET result_blood_group = $2, result_outcome = $3, results_at = NOW(), results_facility_id = $4 WHERE id = $1`,
+    [matchId, bloodGroup, followUp ? 'follow_up' : 'cleared', facility.id]
+  );
+
+  // Lab-confirmed blood group replaces the self-reported one; "I don't know" donors no longer need review for it
+  let status = donor.eligibility_status;
+  let reasons = donor.screening_reasons || '';
+  if (reasons.split(',').includes('blood_type_unknown')) {
+    reasons = reasons.split(',').filter(r => r && r !== 'blood_type_unknown').join(',');
+    if (status === 'needs_review' && reasons === '') status = 'eligible';
+  }
+  if (followUp) status = 'on_hold'; // silent pause: no reason is ever sent to the donor
+  await pool.query(
+    `UPDATE donors SET blood_type = $2, eligibility_status = $3, screening_reasons = $4 WHERE id = $1`,
+    [donor.donor_id, bloodGroup, status, reasons]
+  );
+
+  await sendMessage(
+    from,
+    followUp
+      ? `Saved for ${donor.confirm_code}. The donor's LifeDrop profile is now paused and they will get the same neutral message as every donor. Please contact them in person through your usual counselling process.`
+      : `✅ Saved for ${donor.confirm_code}. The donor will be told their blood group (${bloodGroup}). Thank you!`
+  );
+
+  const groupChanged = donor.blood_type && donor.blood_type !== 'UNKNOWN' && donor.blood_type !== bloodGroup;
+  await notifyCustomerService(
+    followUp
+      ? `⏸️ *Donor Paused After Blood Bank Results*\n\n🏥 *Facility:* ${facility.name}\n👤 *Donor:* ${donor.name} (${donor.phone})\n🔑 *Code:* ${donor.confirm_code}\n\nThe blood bank will contact the donor in person. Do not discuss reasons over WhatsApp.`
+      : `🧪 *Donation Results Recorded*\n\n🏥 *Facility:* ${facility.name}\n👤 *Donor:* ${donor.name} (${donor.phone})\n🔑 *Code:* ${donor.confirm_code}\n🩸 *Blood group:* ${bloodGroup}${groupChanged ? ` (was ${donor.blood_type})` : ''}`
+  );
+
+  await sendResultUpdate(donor, matchId, bloodGroup, facility.name);
+}
+
+// Same neutral text for every donor: direct inside the 24h window, else the donation_update template
+async function sendResultUpdate(donor, matchId, bloodGroup, facilityName) {
+  const withinWindow = donor.last_inbound_at && (Date.now() - new Date(donor.last_inbound_at).getTime()) < 24 * 60 * 60 * 1000;
+  try {
+    if (withinWindow) {
+      await sendMessage(donor.phone, neutralResultMessage(donor.name, donor.confirm_code, bloodGroup, facilityName));
+    } else {
+      await sendDonationUpdateTemplate(donor.name, donor.phone, donor.confirm_code, matchId);
+    }
+  } catch (err) {
+    console.warn('Could not send donation update to donor:', err.response?.data?.error?.message || err.message);
+    await notifyCustomerService(
+      `⚠️ *Could not send donation update*\n\n👤 *Donor:* ${donor.name} (${donor.phone})\n🔑 *Code:* ${donor.confirm_code}\n\nCheck that the 'donation_update' template is approved in WhatsApp Manager.`
+    );
+  }
+}
+
+// Outbound Template for results after the 24h window (tapping "View update" reopens the window)
+async function sendDonationUpdateTemplate(donorName, donorPhone, code, matchId) {
+  await axios.post(
+    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to: donorPhone,
+      type: 'template',
+      template: {
+        name: 'donation_update',
+        language: { code: 'en' },
+        components: [
+          {
+            type: 'body',
+            parameters: [
+              { type: 'text', text: donorName },
+              { type: 'text', text: code }
+            ]
+          },
+          {
+            type: 'button', sub_type: 'quick_reply', index: '0',
+            parameters: [{ type: 'payload', payload: `res_view_${matchId}` }]
+          }
+        ]
+      }
+    },
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
 
