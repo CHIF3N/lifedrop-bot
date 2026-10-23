@@ -219,7 +219,20 @@
             <label class="field">Message
               <textarea name="message" rows="6" maxlength="700" required placeholder="Health tip of the week…"></textarea>
             </label>
-            <p class="muted small"><span id="msg-count">0</span>/700 · Donors see "Hello &lt;name&gt;, a message from the LifeDrop team:" before it.</p>
+            <div class="row-end msg-tools">
+              <p class="muted small"><span id="msg-count">0</span>/700 · Donors see "Hello &lt;name&gt;, a message from the LifeDrop team:" before it.</p>
+              <button type="button" class="btn sm" id="add-share-link">+ Bot share link</button>
+            </div>
+            <div class="image-pick">
+              <label class="field">Image (optional, JPG or PNG, max 5 MB)
+                <input type="file" name="image" accept="image/jpeg,image/png">
+              </label>
+              <div id="image-chosen" class="image-chosen" hidden>
+                <img id="image-thumb" alt="Chosen image">
+                <div><div class="cell-main" id="image-name"></div><div class="cell-sub" id="image-size"></div></div>
+                <button type="button" class="btn sm" id="image-remove">Remove</button>
+              </div>
+            </div>
             <h2>2. Choose who gets it</h2>
             <div class="form-row">
               <label class="field">Send to
@@ -239,10 +252,10 @@
               <p id="preview-summary" class="small"></p>
               <p id="preview-warning" class="warn" hidden></p>
               <div class="phone">
-                <div class="bubble" id="preview-text"></div>
-                <div class="bubble-meta">Normal message · donors active in last 24h</div>
-                <div class="bubble template" id="preview-template"></div>
-                <div class="bubble-meta">Template donor_broadcast · everyone else</div>
+                <div class="bubble"><img class="bubble-img" alt="" hidden><div id="preview-text"></div></div>
+                <div class="bubble-meta" id="preview-text-meta">Normal message · donors active in last 24h</div>
+                <div class="bubble template"><img class="bubble-img" alt="" hidden><div id="preview-template"></div></div>
+                <div class="bubble-meta" id="preview-template-meta">Template donor_broadcast · everyone else</div>
               </div>
               <label class="check"><input type="checkbox" id="confirm-check"> I checked the text and the number of donors</label>
               <div class="row-end">

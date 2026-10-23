@@ -14,6 +14,9 @@ const SESSION_HOURS = 12;
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_BROADCAST_LENGTH = 700; // donor_broadcast body is capped at 1024 chars including its fixed text
 const BROADCAST_TEMPLATE = 'donor_broadcast';
+const BROADCAST_IMAGE_TEMPLATE = 'donor_broadcast_image'; // same text, plus an IMAGE header
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // WhatsApp limit for images
+const GRAPH = 'https://graph.facebook.com/v22.0';
 const STOP_PAYLOAD = 'bcast_stop';
 const BLOOD_TYPES = ['O+', 'O-', 'A+', 'A-', 'B+', 'B-', 'AB+', 'AB-'];
 const FACILITY_TYPES = ['hospital', 'lab', 'blood_bank'];
@@ -129,6 +132,37 @@ function templateStatusRows(required, metaTemplates) {
 const localDay = (col) => `((${col}) AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Douala')::date`;
 const LOCAL_TODAY = `(NOW() AT TIME ZONE 'Africa/Douala')::date`;
 
+// WhatsApp accepts JPEG and PNG images. Check the file's first bytes, not just what the browser claims.
+function detectImageType(buf) {
+  if (!buf || buf.length < 4) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  return null;
+}
+
+// Normal image message (inside the 24h window), the text goes in the caption
+const imageMessageBody = (to, mediaId, caption) => ({
+  messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, caption }
+});
+
+// Template with an IMAGE header, body params and quick-reply payloads
+const imageTemplateBody = (to, name, mediaId, bodyParams, buttonPayloads = []) => ({
+  messaging_product: 'whatsapp',
+  to,
+  type: 'template',
+  template: {
+    name,
+    language: { code: 'en' },
+    components: [
+      { type: 'header', parameters: [{ type: 'image', image: { id: mediaId } }] },
+      { type: 'body', parameters: bodyParams.map(text => ({ type: 'text', text: String(text) })) },
+      ...buttonPayloads.map((payload, index) => ({
+        type: 'button', sub_type: 'quick_reply', index: String(index), parameters: [{ type: 'payload', payload }]
+      }))
+    ]
+  }
+});
+
 // Spreadsheet-safe CSV. Cells starting with = + - @ are prefixed so Excel never runs them as formulas.
 function toCsv(rows, columns) {
   const cell = (v) => {
@@ -154,6 +188,10 @@ function createDashboard({
   whatsappToken = process.env.WHATSAPP_TOKEN,
   delayMs = parseInt(process.env.BROADCAST_DELAY_MS, 10) || 300,
   allowSend = process.env.BROADCASTS_DISABLED !== 'true', // false in local mode: reading real data, never sending
+  phoneNumberId = process.env.PHONE_NUMBER_ID,
+  shareLink = process.env.BOT_SHARE_LINK || 'https://wa.me/237686001785?text=Hi',
+  sendImage, // (to, mediaId, caption); defaults to the Graph API below
+  sendImageTemplate, // (to, name, mediaId, bodyParams, buttonPayloads)
   templatesFile = path.join(__dirname, 'templates', 'WHATSAPP_TEMPLATES.md')
 }) {
   const router = express.Router();
@@ -193,6 +231,8 @@ function createDashboard({
       details JSONB,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS image_media_id TEXT;
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS image_name TEXT;
     ALTER TABLE donors ADD COLUMN IF NOT EXISTS broadcast_opt_out BOOLEAN DEFAULT FALSE;
     ALTER TABLE donors ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP;
     UPDATE broadcasts SET status = 'interrupted', finished_at = NOW() WHERE status = 'sending';
@@ -201,7 +241,7 @@ function createDashboard({
   router.use(express.json({ limit: '50kb' }));
   router.use((req, res, next) => {
     res.set({
-      'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' https://api.fontshare.com; font-src https://cdn.fontshare.com; script-src 'self'; frame-ancestors 'none'",
+      'Content-Security-Policy': "default-src 'self'; img-src 'self' data: blob:; style-src 'self' https://api.fontshare.com; font-src https://cdn.fontshare.com; script-src 'self'; frame-ancestors 'none'",
       'X-Frame-Options': 'DENY',
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer',
@@ -266,7 +306,34 @@ function createDashboard({
     [action, targetType, targetId, JSON.stringify(details)]
   ).catch(err => console.warn('Admin log error:', err.message));
 
-  router.get('/api/me', (req, res) => res.json({ ok: true, wabaConfigured: Boolean(wabaId), allowSend }));
+  router.get('/api/me', (req, res) => res.json({ ok: true, wabaConfigured: Boolean(wabaId), allowSend, shareLink }));
+
+  // Graph API senders for images (the bot's own helpers only do text and text templates)
+  const graphHeaders = { Authorization: `Bearer ${whatsappToken}`, 'Content-Type': 'application/json' };
+  sendImage = sendImage || ((to, mediaId, caption) =>
+    axios.post(`${GRAPH}/${phoneNumberId}/messages`, imageMessageBody(to, mediaId, caption), { headers: graphHeaders }));
+  sendImageTemplate = sendImageTemplate || ((to, name, mediaId, params, buttons) =>
+    axios.post(`${GRAPH}/${phoneNumberId}/messages`, imageTemplateBody(to, name, mediaId, params, buttons), { headers: graphHeaders }));
+
+  // Broadcast image: the browser sends the raw file, we upload it to Meta and get back a media id (valid 30 days)
+  router.post('/api/broadcast-image', express.raw({ type: ['image/jpeg', 'image/png'], limit: MAX_IMAGE_BYTES }), api(async (req, res) => {
+    if (!allowSend) return res.status(403).json({ error: 'Images are turned off here (local mode). Use the live dashboard on Render.' });
+    const buf = Buffer.isBuffer(req.body) ? req.body : null;
+    const type = detectImageType(buf);
+    if (!type) return res.status(400).json({ error: 'Pick a JPG or PNG image.' });
+    const name = String(req.get('x-file-name') || `broadcast.${type === 'image/png' ? 'png' : 'jpg'}`).replace(/[^\w.\- ]/g, '').slice(0, 80) || 'image';
+    const form = new FormData();
+    form.append('messaging_product', 'whatsapp');
+    form.append('type', type);
+    form.append('file', new Blob([buf], { type }), name);
+    try {
+      const r = await axios.post(`${GRAPH}/${phoneNumberId}/media`, form, { headers: { Authorization: `Bearer ${whatsappToken}` } });
+      if (!r.data?.id) throw new Error('Meta did not return a media id');
+      res.json({ mediaId: String(r.data.id), type, bytes: buf.length, name });
+    } catch (err) {
+      res.status(502).json({ error: 'Could not upload the image to WhatsApp: ' + errorText(err) });
+    }
+  }));
 
   // ----- Overview -----
   router.get('/api/stats', api(async (req, res) => {
@@ -588,16 +655,17 @@ function createDashboard({
   }
 
   router.post('/api/broadcasts/preview', api(async (req, res) => {
-    const { message, audience = {} } = req.body || {};
+    const { message, audience = {}, with_image: withImage = false } = req.body || {};
     const messageError = checkMessage(message);
     if (messageError) return res.status(400).json({ error: messageError });
     const filter = audienceFilter(audience);
     if (filter.error) return res.status(400).json({ error: filter.error });
     const counts = await audienceCounts(filter);
+    const templateName = withImage ? BROADCAST_IMAGE_TEMPLATE : BROADCAST_TEMPLATE;
     let templateState = 'UNKNOWN';
     try {
       const t = await templateStatus();
-      if (t.configured) templateState = t.rows.find(r => r.name === BROADCAST_TEMPLATE)?.status || 'MISSING';
+      if (t.configured) templateState = t.rows.find(r => r.name === templateName)?.status || 'MISSING';
     } catch (err) { /* shown as UNKNOWN */ }
     const sample = { name: 'Jean', last_inbound_at: null };
     res.json({
@@ -605,7 +673,7 @@ function createDashboard({
       total: counts.total,
       inWindow: counts.inWindow,
       viaTemplate: counts.total - counts.inWindow,
-      templateName: BROADCAST_TEMPLATE,
+      templateName,
       templateStatus: templateState,
       sampleText: broadcastPayload({ ...sample, last_inbound_at: new Date() }, message).text,
       sampleTemplate: `Hello Jean, a message from the LifeDrop team: ${broadcastPayload(sample, message).params[1]}\n\nThank you for being a LifeDrop blood donor. Reply STOP to stop these updates.`,
@@ -613,16 +681,19 @@ function createDashboard({
     });
   }));
 
-  async function runBroadcast(id, donors, message) {
+  async function runBroadcast(id, donors, message, imageId = null) {
     let sent = 0, failed = 0, viaText = 0, viaTemplate = 0;
     for (let i = 0; i < donors.length; i++) {
       const d = donors[i];
       const payload = broadcastPayload(d, message);
+      const channel = imageId ? `image_${payload.channel}`.replace('image_text', 'image') : payload.channel; // text | template | image | image_template
       let status = 'sent';
       let error = null;
       try {
-        if (payload.channel === 'text') await sendMessage(d.phone, payload.text);
-        else await sendTemplate(d.phone, BROADCAST_TEMPLATE, payload.params, [STOP_PAYLOAD]);
+        if (channel === 'text') await sendMessage(d.phone, payload.text);
+        else if (channel === 'template') await sendTemplate(d.phone, BROADCAST_TEMPLATE, payload.params, [STOP_PAYLOAD]);
+        else if (channel === 'image') await sendImage(d.phone, imageId, payload.text);
+        else await sendImageTemplate(d.phone, BROADCAST_IMAGE_TEMPLATE, imageId, payload.params, [STOP_PAYLOAD]);
         sent++;
         if (payload.channel === 'text') viaText++; else viaTemplate++;
       } catch (err) {
@@ -632,7 +703,7 @@ function createDashboard({
       }
       await pool.query(
         `INSERT INTO broadcast_recipients (broadcast_id, donor_id, phone, channel, status, error) VALUES ($1, $2, $3, $4, $5, $6)`,
-        [id, d.id, d.phone, payload.channel, status, error]
+        [id, d.id, d.phone, channel, status, error]
       ).catch(err => console.error('Broadcast log error:', err.message));
       if ((i + 1) % 20 === 0) {
         await pool.query(`UPDATE broadcasts SET sent = $2, failed = $3 WHERE id = $1`, [id, sent, failed]).catch(() => {});
@@ -646,9 +717,11 @@ function createDashboard({
   }
 
   router.post('/api/broadcasts', api(async (req, res) => {
-    const { message, audience = {}, confirm, expected_count: expected } = req.body || {};
+    const { message, audience = {}, confirm, expected_count: expected, image = null } = req.body || {};
+    const imageId = image?.media_id ? String(image.media_id) : null;
     if (!allowSend) return res.status(403).json({ error: 'Sending is turned off here (local mode). Send broadcasts from the live dashboard on Render.' });
     if (confirm !== true) return res.status(400).json({ error: 'Confirm the broadcast first.' });
+    if (imageId && !/^\d{5,30}$/.test(imageId)) return res.status(400).json({ error: 'The image upload is not valid. Pick the image again.' });
     const messageError = checkMessage(message);
     if (messageError) return res.status(400).json({ error: messageError });
     const filter = audienceFilter(audience);
@@ -667,12 +740,12 @@ function createDashboard({
     }
     const text = String(message).trim();
     const inserted = await pool.query(
-      `INSERT INTO broadcasts (message, audience, total) VALUES ($1, $2, $3) RETURNING id`,
-      [text, JSON.stringify({ ...audience, label: describeAudience(audience) }), donors.length]
+      `INSERT INTO broadcasts (message, audience, total, image_media_id, image_name) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [text, JSON.stringify({ ...audience, label: describeAudience(audience) }), donors.length, imageId, imageId ? String(image.name || '').slice(0, 80) : null]
     );
     const id = inserted.rows[0].id;
-    await logAction('broadcast_sent', 'broadcast', id, { audience: describeAudience(audience), total: donors.length });
-    running = runBroadcast(id, donors, text)
+    await logAction('broadcast_sent', 'broadcast', id, { audience: describeAudience(audience), total: donors.length, image: Boolean(imageId) });
+    running = runBroadcast(id, donors, text, imageId)
       .catch(async err => {
         console.error('Broadcast error:', err.message);
         await pool.query(`UPDATE broadcasts SET status = 'interrupted', finished_at = NOW() WHERE id = $1`, [id]).catch(() => {});
@@ -683,7 +756,7 @@ function createDashboard({
 
   router.get('/api/broadcasts', api(async (req, res) => {
     const result = await pool.query(
-      `SELECT b.id, b.message, b.audience, b.status, b.total, b.created_at, b.finished_at, b.via_text, b.via_template,
+      `SELECT b.id, b.message, b.audience, b.status, b.total, b.created_at, b.finished_at, b.via_text, b.via_template, b.image_name,
          COALESCE(c.sent, 0) AS sent, COALESCE(c.failed, 0) AS failed
        FROM broadcasts b LEFT JOIN (
          SELECT broadcast_id, COUNT(*) FILTER (WHERE status = 'sent') AS sent, COUNT(*) FILTER (WHERE status = 'failed') AS failed
@@ -725,6 +798,13 @@ function createDashboard({
     return true;
   }
 
+  // Body errors (e.g. image over 5 MB) as JSON, like every other API error
+  router.use((err, req, res, next) => {
+    if (!err) return next();
+    const tooBig = err.type === 'entity.too.large';
+    res.status(err.status || 500).json({ error: tooBig ? 'Image is too big (max 5 MB).' : err.message });
+  });
+
   return {
     router,
     handleOptOut,
@@ -740,5 +820,6 @@ const isStartText = (text) => /^start$/i.test(String(text || '').trim());
 module.exports = {
   createDashboard, toCsv, maskPhone, sessionToken, validSessionToken, parseCookies, withinWindow, broadcastPayload,
   audienceFilter, describeAudience, requiredTemplates, templateStatusRows, isStopText, isStartText,
-  STOP_PAYLOAD, MAX_BROADCAST_LENGTH
+  detectImageType, imageMessageBody, imageTemplateBody,
+  STOP_PAYLOAD, MAX_BROADCAST_LENGTH, BROADCAST_IMAGE_TEMPLATE
 };

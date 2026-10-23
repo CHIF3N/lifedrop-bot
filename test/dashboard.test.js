@@ -5,7 +5,7 @@ const path = require('path');
 const express = require('express');
 const axios = require('axios');
 const {
-  createDashboard, toCsv, maskPhone, sessionToken, validSessionToken, parseCookies, broadcastPayload,
+  createDashboard, toCsv, detectImageType, imageMessageBody, imageTemplateBody, maskPhone, sessionToken, validSessionToken, parseCookies, broadcastPayload,
   audienceFilter, requiredTemplates, templateStatusRows, isStopText, isStartText, STOP_PAYLOAD
 } = require('../dashboard');
 const { createTestPool } = require('./helpers/pglite-pool');
@@ -82,7 +82,7 @@ test('STOP and START replies are recognised', () => {
 
 // ---------- HTTP + database (PGlite, no real WhatsApp) ----------
 
-async function setup({ sendFails = [], allowSend = true } = {}) {
+async function setup({ sendFails = [], allowSend = true, stubImageSenders = true } = {}) {
   const pool = await createTestPool();
   const now = Date.now();
   const recent = new Date(now - HOUR).toISOString();
@@ -104,11 +104,20 @@ async function setup({ sendFails = [], allowSend = true } = {}) {
     if (sendFails.includes(to)) throw Object.assign(new Error('fail'), { response: { data: { error: { message: 'Template not approved' } } } });
     sent.push({ to, type: 'template', name, params, buttons });
   };
+  const sendImage = async (to, mediaId, caption) => {
+    if (sendFails.includes(to)) throw new Error('fail');
+    sent.push({ to, type: 'image', mediaId, caption });
+  };
+  const sendImageTemplate = async (to, name, mediaId, params, buttons) => {
+    if (sendFails.includes(to)) throw new Error('fail');
+    sent.push({ to, type: 'image_template', name, mediaId, params, buttons });
+  };
+  const imageSenders = stubImageSenders ? { sendImage, sendImageTemplate } : {};
   const getStats = async (days) => ({
     donors: { total: '4', new: '4', ready: '3', needs_review: '1' }, requests: {}, matches: {},
     donations: {}, facilities: {}, waitlist: {}, activity: {}, days
   });
-  const dashboard = createDashboard({ pool, getStats, sendMessage, sendTemplate, adminKey: KEY, wabaId: 'WABA', whatsappToken: 'T', delayMs: 0, allowSend });
+  const dashboard = createDashboard({ pool, getStats, sendMessage, sendTemplate, adminKey: KEY, wabaId: 'WABA', whatsappToken: 'T', delayMs: 0, allowSend, phoneNumberId: 'PNID', ...imageSenders });
   await dashboard.schemaReady;
   const app = express();
   app.use('/admin', dashboard.router);
@@ -123,13 +132,17 @@ async function setup({ sendFails = [], allowSend = true } = {}) {
     const json = (res.headers.get('content-type') || '').includes('json');
     return { status: res.status, headers: res.headers, body: json ? JSON.parse(text) : text };
   };
+  const upload = async (buf, type, name = 'tip.png') => {
+    const res = await fetch(`${base}/api/broadcast-image`, { method: 'POST', headers: { 'Content-Type': type, 'X-File-Name': name, cookie }, body: buf });
+    return { status: res.status, body: await res.json() };
+  };
   const login = async () => {
     const res = await call('POST', '/login', { key: KEY });
     cookie = res.headers.get('set-cookie').split(';')[0];
     return res;
   };
   const close = async () => { await new Promise(r => server.close(r)); await pool.end(); };
-  return { pool, dashboard, call, login, close, sent };
+  return { pool, dashboard, call, login, close, sent, upload };
 }
 
 test('everything under /admin/api is 403 until logged in with ADMIN_KEY', async () => {
@@ -362,4 +375,120 @@ test('CSV export uses the list filters and masks phones unless revealed', async 
     assert.ok(revealed.body.includes('237600000001'));
     assert.strictEqual((await t.call('GET', '/api/export/secrets.csv')).status, 404);
   } finally { await t.close(); }
+});
+
+// ---------- Broadcast images ----------
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+const JPG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10]);
+
+test('only real JPEG and PNG files are accepted as broadcast images', () => {
+  assert.strictEqual(detectImageType(PNG), 'image/png');
+  assert.strictEqual(detectImageType(JPG), 'image/jpeg');
+  assert.strictEqual(detectImageType(Buffer.from('GIF89a')), null);
+  assert.strictEqual(detectImageType(Buffer.from('<svg')), null);
+  assert.strictEqual(detectImageType(null), null);
+});
+
+test('image message and image template have the shape WhatsApp expects', () => {
+  assert.deepStrictEqual(imageMessageBody('2376', '999', 'Hi'), {
+    messaging_product: 'whatsapp', to: '2376', type: 'image', image: { id: '999', caption: 'Hi' }
+  });
+  const t = imageTemplateBody('2376', 'donor_broadcast_image', '999', ['Jean', 'Tip'], [STOP_PAYLOAD]);
+  assert.strictEqual(t.template.name, 'donor_broadcast_image');
+  assert.deepStrictEqual(t.template.components[0], { type: 'header', parameters: [{ type: 'image', image: { id: '999' } }] });
+  assert.deepStrictEqual(t.template.components[1].parameters.map(p => p.text), ['Jean', 'Tip']);
+  assert.deepStrictEqual(t.template.components[2], {
+    type: 'button', sub_type: 'quick_reply', index: '0', parameters: [{ type: 'payload', payload: STOP_PAYLOAD }]
+  });
+});
+
+test('donor_broadcast_image is a required template', () => {
+  const md = fs.readFileSync(path.join(__dirname, '..', 'templates', 'WHATSAPP_TEMPLATES.md'), 'utf8');
+  assert.deepStrictEqual(requiredTemplates(md).find(r => r.name === 'donor_broadcast_image'), { name: 'donor_broadcast_image', category: 'Marketing' });
+});
+
+test('image upload goes to the WhatsApp media endpoint (stubbed) and rejects bad files', async () => {
+  const t = await setup();
+  const realPost = axios.post;
+  const calls = [];
+  axios.post = async (url, body, opts) => { calls.push({ url, body, opts }); return { data: { id: '1234567890' } }; };
+  try {
+    await t.login();
+    const ok = await t.upload(PNG, 'image/png', 'tip.png');
+    assert.strictEqual(ok.status, 200);
+    assert.deepStrictEqual(ok.body, { mediaId: '1234567890', type: 'image/png', bytes: PNG.length, name: 'tip.png' });
+    assert.strictEqual(calls[0].url, 'https://graph.facebook.com/v22.0/PNID/media');
+    assert.strictEqual(calls[0].body.get('messaging_product'), 'whatsapp');
+    assert.strictEqual(calls[0].body.get('type'), 'image/png');
+    assert.strictEqual(calls[0].body.get('file').size, PNG.length);
+    assert.strictEqual(calls[0].opts.headers.Authorization, 'Bearer T');
+
+    assert.strictEqual((await t.upload(Buffer.from('GIF89a....'), 'image/png')).status, 400); // lies about its type
+    const big = await t.upload(Buffer.concat([PNG, Buffer.alloc(5 * 1024 * 1024)]), 'image/png');
+    assert.strictEqual(big.status, 413);
+    assert.match(big.body.error, /max 5 MB/);
+    assert.strictEqual(calls.length, 1);
+  } finally {
+    axios.post = realPost;
+    await t.close();
+  }
+});
+
+test('image upload is refused in local mode and without login', async () => {
+  const t = await setup({ allowSend: false });
+  try {
+    assert.strictEqual((await t.upload(PNG, 'image/png')).status, 403); // not logged in
+    await t.login();
+    const r = await t.upload(PNG, 'image/png');
+    assert.strictEqual(r.status, 403);
+    assert.match(r.body.error, /local mode/);
+  } finally { await t.close(); }
+});
+
+test('broadcast with an image: image message inside 24h, image template outside, both logged', async () => {
+  const t = await setup();
+  try {
+    await t.login();
+    const body = { message: 'Give blood, save lives. Join: https://wa.me/237686001785?text=Hi', audience: { type: 'blood_type', value: 'O+' } };
+    const preview = await t.call('POST', '/api/broadcasts/preview', { ...body, with_image: true });
+    assert.strictEqual(preview.body.templateName, 'donor_broadcast_image');
+    assert.strictEqual(preview.body.total, 2);
+
+    assert.strictEqual((await t.call('POST', '/api/broadcasts', { ...body, confirm: true, expected_count: 2, image: { media_id: '../etc' } })).status, 400);
+    const started = await t.call('POST', '/api/broadcasts', { ...body, confirm: true, expected_count: 2, image: { media_id: '1234567890', name: 'tip.png' } });
+    assert.strictEqual(started.status, 202);
+    await t.dashboard.running;
+
+    const [inWindow, outside] = t.sent;
+    assert.deepStrictEqual([inWindow.to, inWindow.type, inWindow.mediaId], ['237600000001', 'image', '1234567890']);
+    assert.match(inWindow.caption, /^Hello Jean, a message from the LifeDrop team:\n\nGive blood/);
+    assert.deepStrictEqual([outside.to, outside.type, outside.name, outside.mediaId], ['237600000002', 'image_template', 'donor_broadcast_image', '1234567890']);
+    assert.deepStrictEqual(outside.params, ['Marie', body.message]);
+    assert.deepStrictEqual(outside.buttons, [STOP_PAYLOAD]);
+
+    const detail = await t.call('GET', `/api/broadcasts/${started.body.id}`);
+    assert.strictEqual(detail.body.broadcast.image_media_id, '1234567890');
+    assert.strictEqual(detail.body.broadcast.image_name, 'tip.png');
+    assert.deepStrictEqual(detail.body.recipients.map(r => r.channel), ['image', 'image_template']);
+    assert.strictEqual((await t.call('GET', '/api/broadcasts')).body.rows[0].image_name, 'tip.png');
+  } finally { await t.close(); }
+});
+
+test('default image senders call the Graph API messages endpoint (stubbed)', async () => {
+  const t = await setup({ stubImageSenders: false });
+  const realPost = axios.post;
+  const calls = [];
+  axios.post = async (url, body) => { calls.push({ url, body }); return { data: {} }; };
+  try {
+    await t.login();
+    const body = { message: 'Tip', audience: { type: 'blood_type', value: 'O+' } };
+    await t.call('POST', '/api/broadcasts', { ...body, confirm: true, expected_count: 2, image: { media_id: '555555' } });
+    await t.dashboard.running;
+    assert.deepStrictEqual(calls.map(c => c.url), Array(2).fill('https://graph.facebook.com/v22.0/PNID/messages'));
+    assert.strictEqual(calls[0].body.type, 'image');
+    assert.strictEqual(calls[1].body.template.name, 'donor_broadcast_image');
+  } finally {
+    axios.post = realPost;
+    await t.close();
+  }
 });

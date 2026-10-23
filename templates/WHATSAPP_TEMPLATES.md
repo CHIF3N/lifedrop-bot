@@ -19,12 +19,13 @@ Status column: **Used by bot** = code already sends it. **Text only** = submit n
 | 3 | `lifedrop_ops_report` | Utility | Used by bot |
 | 4 | `lifedrop_daily_summary` | Utility | Used by bot |
 | 5 | `blood_sos` | Utility | Text only |
-| 6 | `donor_broadcast` | Marketing | Text only |
+| 6 | `donor_broadcast` | Marketing | Used by dashboard broadcasts |
 | 7 | `supporter_contribution` | Marketing | Text only |
 | 8 | `hospital_admin_notice` | Utility | Used by bot (welcome when you run `addhospital`) |
 | 9 | `hospital_donor_incoming` | Utility | Used by bot |
 | 10 | `hospital_request_alert` | Utility | Used by bot |
 | 11 | `blood_group_confirmed` | Utility | Used by bot |
+| 12 | `donor_broadcast_image` | Marketing | Used by dashboard broadcasts with an image |
 
 ---
 
@@ -166,3 +167,20 @@ Hi {{1}}, your blood group {{2}} has been confirmed by {{3}}. You are now a conf
 **Samples:** {{1}} `Jean` · {{2}} `O+` · {{3}} `Buea Regional Lab`
 
 Used only when the donor hasn't messaged the bot in the last 24 hours when lab staff confirm their free test.
+
+---
+
+## 12. `donor_broadcast_image` (Marketing): news to all donors, with a picture
+
+Same as `donor_broadcast`, with an image on top. The dashboard uses it when a broadcast has an image and the donor is outside the 24h window.
+Inside the window, donors get a normal image message with the same text as the caption.
+
+**Header**: Image (upload any sample JPG/PNG when submitting; the real picture is sent with each message)
+**Body**
+```
+Hello {{1}}, a message from the LifeDrop team: {{2}}
+
+Thank you for being a LifeDrop blood donor. Reply STOP to stop these updates.
+```
+**Button** (Quick reply): `Stop updates`
+**Samples:** {{1}} `Jean` · {{2}} `Healthy adults can give blood every 3 to 4 months. Invite a friend to join LifeDrop: https://wa.me/237686001785?text=Hi`

@@ -18,6 +18,10 @@ delete process.env.GEMINI_API_KEY;
 // Fake WhatsApp: print instead of sending. 237600000013 always fails, to show how failures look.
 axios.post = async (url, body) => {
   if (!String(url).includes('graph.facebook.com')) throw new Error(`Blocked outbound call in dev mode: ${url}`);
+  if (String(url).endsWith('/media')) {
+    console.log('📤 [fake WhatsApp] image uploaded');
+    return { data: { id: '1234567890123456' } };
+  }
   if (body?.to === '237600000013') {
     throw Object.assign(new Error('Request failed'), { response: { data: { error: { message: '(dev) Recipient phone number not on WhatsApp' } } } });
   }

@@ -8,6 +8,9 @@ let lastStats = null; // kept so charts can be redrawn on theme change
 let pendingBroadcast = null; // the request that "Send" will post
 let pollTimer = null;
 let openBroadcastId = null; // broadcast whose recipient list is shown
+let shareLink = 'https://wa.me/237686001785?text=Hi';
+let imageFile = null; // picked broadcast image (uploaded to WhatsApp only when sending)
+let imageUrl = null; // local preview URL for it
 const charts = {};
 
 // ---------- Small helpers ----------
@@ -725,6 +728,36 @@ bForm.audience.addEventListener('change', () => {
 });
 for (const name of ['blood_type', 'city', 'window_only']) bForm[name].addEventListener('change', hidePreview);
 
+$('#add-share-link').addEventListener('click', () => {
+  const msg = bForm.message;
+  if (!msg.value.includes(shareLink)) msg.value = `${msg.value.trimEnd()}${msg.value.trim() ? '\n\n' : ''}Join LifeDrop: ${shareLink}`.slice(0, 700);
+  msg.dispatchEvent(new Event('input'));
+});
+
+function setImage(file) {
+  if (imageUrl) URL.revokeObjectURL(imageUrl);
+  imageFile = file || null;
+  imageUrl = imageFile ? URL.createObjectURL(imageFile) : null;
+  $('#image-chosen').hidden = !imageFile;
+  if (imageFile) {
+    $('#image-thumb').src = imageUrl;
+    $('#image-name').textContent = imageFile.name;
+    $('#image-size').textContent = `${(imageFile.size / 1024 / 1024).toFixed(2)} MB`;
+  } else {
+    bForm.image.value = '';
+  }
+  hidePreview();
+}
+
+bForm.image.addEventListener('change', () => {
+  const file = bForm.image.files[0];
+  if (!file) return setImage(null);
+  if (!['image/jpeg', 'image/png'].includes(file.type)) { toast('Pick a JPG or PNG image.', true); return setImage(null); }
+  if (file.size > 5 * 1024 * 1024) { toast('Image is too big (max 5 MB).', true); return setImage(null); }
+  setImage(file);
+});
+$('#image-remove').addEventListener('click', () => setImage(null));
+
 function hidePreview() {
   pendingBroadcast = null;
   $('#broadcast-preview').hidden = true;
@@ -754,21 +787,27 @@ bForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = { message: bForm.message.value, audience: audienceFromForm() };
   try {
-    const p = await api('/admin/api/broadcasts/preview', { method: 'POST', body });
+    const p = await api('/admin/api/broadcasts/preview', { method: 'POST', body: { ...body, with_image: Boolean(imageFile) } });
     pendingBroadcast = { ...body, expected_count: p.total };
     const time = p.secondsEstimate > 90 ? `about ${Math.ceil(p.secondsEstimate / 60)} min` : `about ${p.secondsEstimate} s`;
     $('#preview-total').textContent = fmt(p.total);
-    $('#preview-summary').textContent = `${p.audience}: ${p.inWindow} get a normal message, ${p.viaTemplate} get the template. Sending takes ${time}.`;
+    $('#preview-summary').textContent = `${p.audience}: ${p.inWindow} get ${imageFile ? 'an image message' : 'a normal message'}, ${p.viaTemplate} get the template. Sending takes ${time}.`;
     let warning = '';
     if (p.total === 0) warning = 'No donors match. Nothing will be sent.';
     else if (p.viaTemplate > 0 && p.templateStatus !== 'APPROVED') {
       const st = p.templateStatus === 'UNKNOWN' ? 'not checked (WABA_ID missing?)' : (TEMPLATE_STATUS[p.templateStatus]?.[0] || p.templateStatus).toLowerCase();
-      warning = `Template donor_broadcast is ${st}. The ${p.viaTemplate} donor(s) outside the 24h window will fail. Tick "Only donors who messaged the bot in the last 24 hours" to skip them.`;
+      warning = `Template ${p.templateName} is ${st}. The ${p.viaTemplate} donor(s) outside the 24h window will fail. Tick "Only donors who messaged the bot in the last 24 hours" to skip them.`;
     }
     $('#preview-warning').textContent = warning;
     $('#preview-warning').hidden = !warning;
     $('#preview-text').textContent = p.sampleText;
     $('#preview-template').textContent = p.sampleTemplate;
+    for (const img of $$('#broadcast-preview .bubble-img')) {
+      img.hidden = !imageUrl;
+      if (imageUrl) img.src = imageUrl;
+    }
+    $('#preview-text-meta').textContent = `${imageFile ? 'Image message' : 'Normal message'} · donors active in last 24h`;
+    $('#preview-template-meta').textContent = `Template ${p.templateName} · everyone else`;
     $('#confirm-check').checked = false;
     $('#broadcast-send').disabled = true;
     $('#broadcast-send').textContent = `Send to ${fmt(p.total)} donor(s)`;
@@ -793,10 +832,23 @@ $('#broadcast-send').addEventListener('click', async () => {
   if (!yes) return;
   $('#broadcast-send').disabled = true;
   try {
-    const { id, total } = await api('/admin/api/broadcasts', { method: 'POST', body: { ...pendingBroadcast, confirm: true } });
+    let image = null;
+    if (imageFile) {
+      toast('Uploading the image to WhatsApp…');
+      const res = await fetch('/admin/api/broadcast-image', {
+        method: 'POST',
+        headers: { 'Content-Type': imageFile.type, 'X-File-Name': imageFile.name.replace(/[^\w.\- ]/g, '_').slice(0, 80) },
+        body: imageFile
+      });
+      const up = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(up.error || `Image upload failed (${res.status})`);
+      image = { media_id: up.mediaId, name: up.name };
+    }
+    const { id, total } = await api('/admin/api/broadcasts', { method: 'POST', body: { ...pendingBroadcast, image, confirm: true } });
     toast(`Broadcast #${id} started: sending to ${total} donor(s).`);
     hidePreview();
     bForm.reset();
+    setImage(null);
     bForm.audience.dispatchEvent(new Event('change')); // hide the town / blood type boxes again
     $('#msg-count').textContent = '0';
     openBroadcastId = id;
@@ -815,7 +867,7 @@ async function loadBroadcasts() {
     ['#', r => r.id],
     ['When', r => fmtDate(r.created_at)],
     ['Audience', r => r.audience?.label || ''],
-    ['Message', r => el('span', { class: 'cell-sub' }, r.message.length > 90 ? `${r.message.slice(0, 90)}…` : r.message)],
+    ['Message', r => el('span', { class: 'cell-sub' }, `${r.image_name ? '🖼 ' : ''}${r.message.length > 90 ? `${r.message.slice(0, 90)}…` : r.message}`)],
     ['Status', r => { const [t, tone] = BROADCAST_STATUS[r.status] || [r.status, '']; return badge(t, tone); }],
     ['Sent', r => `${r.sent} / ${r.total}`],
     ['Failed', r => (n(r.failed) ? badge(String(r.failed), 'danger') : '0')],
@@ -834,7 +886,7 @@ async function showBroadcast(id) {
   renderTable($('#table-broadcast-recipients'), recipients, [
     ['Donor', r => r.name],
     ['Phone', r => el('span', { class: 'mono' }, r.phone)],
-    ['Sent as', r => (r.channel === 'template' ? 'Template' : 'Normal message')],
+    ['Sent as', r => ({ text: 'Normal message', template: 'Template', image: 'Image message', image_template: 'Image template' }[r.channel] || r.channel)],
     ['Result', r => (r.status === 'sent' ? badge('Sent', 'ok') : badge('Failed', 'danger'))],
     ['Error', r => (r.error ? el('span', { class: 'cell-sub' }, r.error) : '')],
     ['Time', r => fmtDate(r.sent_at)]
@@ -852,6 +904,7 @@ async function start() {
   $('#login').hidden = true;
   $('#app').hidden = false;
   $('#local-banner').hidden = me.allowSend !== false;
+  if (me.shareLink) shareLink = me.shareLink;
   $('#conn-text').textContent = me.allowSend === false ? 'Live database · local' : 'Live database';
   openTab(currentTab);
 }

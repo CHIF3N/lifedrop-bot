@@ -325,3 +325,13 @@ td > div > .cell-sub, td > div > .cell-main { white-space: nowrap; }
 #table-requests th:last-child, #table-requests td:last-child { position: sticky; right: 0; background: var(--surface); box-shadow: -2px 0 0 var(--border); }
 #table-requests tbody tr:hover td:last-child { background: var(--surface-2); }
 .name-link .cell-main, .name-link .cell-sub { white-space: nowrap; }
+
+/* Broadcast image */
+.msg-tools { justify-content: space-between; }
+.msg-tools .muted { margin-right: 0; }
+.image-pick { display: flex; flex-direction: column; gap: 10px; }
+.image-pick input[type="file"] { height: auto; padding: 10px; }
+.image-chosen { display: flex; align-items: center; gap: 12px; border: 2px solid var(--border); border-radius: 14px; padding: 10px; }
+.image-chosen img { width: 64px; height: 64px; object-fit: cover; border-radius: 10px; }
+.image-chosen > div { flex: 1; min-width: 0; }
+.bubble-img { display: block; width: 100%; max-height: 220px; object-fit: cover; border-radius: 10px; margin-bottom: 8px; }
