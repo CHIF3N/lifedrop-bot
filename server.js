@@ -7,7 +7,7 @@ const { daysUntilEligible } = require('./deferral');
 const geo = require('./geo');
 const { upcomingSlots, formatSlot, slotId, parseSlotId } = require('./slots');
 const { evaluateScreening } = require('./screening');
-const { parseResultsRequest, normalizeBloodGroup, parseResultButton, neutralResultMessage } = require('./results');
+const { parseResultsRequest, normalizeBloodGroup, parseResultButton, neutralResultMessage, parseLabCode, statusAfterBloodGroupConfirmed } = require('./results');
 const { formatTime, toTemplateParam, splitReport, formatStatsReport, dailySummaryParams } = require('./reports');
 const { normalizePhone, parseAdminCommand, HELP_TEXT } = require('./admin');
 const { BLOOD_GROUP_ROWS, REQUEST_REASONS, reasonTitle, requestSummary, parseContact } = require('./request-form');
@@ -106,6 +106,7 @@ async function initDb() {
         created_at TIMESTAMP DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS appointments_slot_idx ON appointments (facility_id, slot_at);
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS code TEXT;
       CREATE TABLE IF NOT EXISTS feature_interest (
         phone TEXT NOT NULL,
         feature TEXT NOT NULL,
@@ -195,7 +196,9 @@ app.post('/webhook', async (req, res) => {
           await handleResultsRequest(from, resultsCode);
         } else if (/^LD-?\s?\d{5}$/i.test(text)) {
           await handleFacilityCode(from, text);
-        } else if (sessions[from]?.step !== 'results_blood_group' && await handleFacilityMessage(from, text)) {
+        } else if (parseLabCode(text)) {
+          await handleLabCode(from, parseLabCode(text));
+        } else if (!['results_blood_group', 'lab_blood_group'].includes(sessions[from]?.step) && await handleFacilityMessage(from, text)) {
           // Partner hospital staff: handled by the hospital menu
         } else {
           await handleMessage(from, text);
@@ -222,6 +225,8 @@ async function handleButton(from, buttonId) {
     await handleResultButton(from, buttonId);
   } else if (buttonId.startsWith('labs_')) {
     await handleLabOffer(from, buttonId);
+  } else if (buttonId.startsWith('lt_')) {
+    await handleLabCodeButton(from, buttonId);
   } else if (buttonId.startsWith('appt_')) {
     await handleAppointmentButton(from, buttonId);
   } else {
@@ -409,6 +414,9 @@ async function handleMessage(from, text) {
   // Blood bank staff typing the blood group for a results entry
   if (session.step === 'results_blood_group') {
     return handleResultsBloodGroup(from, text);
+  }
+  if (session.step === 'lab_blood_group') {
+    return handleLabBloodGroup(from, text);
   }
 
   // Home lab test waitlist (feature coming soon)
@@ -1272,7 +1280,7 @@ async function generateConfirmCode() {
 
 async function getPartnerFacility(phone) {
   const result = await pool.query(
-    `SELECT id, name FROM facilities WHERE is_partner = TRUE AND regexp_replace(staff_phone, '\\D', '', 'g') = $1 LIMIT 1`,
+    `SELECT id, name, staff_phone, does_lab_tests FROM facilities WHERE is_partner = TRUE AND regexp_replace(staff_phone, '\\D', '', 'g') = $1 LIMIT 1`,
     [phone]
   );
   return result.rows[0] || null;
@@ -1386,7 +1394,7 @@ async function handleAdminCommand(from, command) {
       const id = inserted.rows[0].id;
       const welcome = await sendToFacility(
         { id, name: f.name, staff_phone: f.staff_phone },
-        `🏥 Welcome to LifeDrop, ${f.name}!\n\nThis WhatsApp number is now registered as your facility's LifeDrop line.\n\n${facilityMenuText(f.name)}`,
+        `🏥 Welcome to LifeDrop, ${f.name}!\n\nThis WhatsApp number is now registered as your facility's LifeDrop line.\n\n${facilityMenuText(f.name, f.does_lab_tests)}`,
         'hospital_admin_notice',
         [f.name, 'This WhatsApp number is now registered as your LifeDrop line. Reply "menu" to see what you can do.']
       );
@@ -1413,7 +1421,7 @@ async function handleAdminCommand(from, command) {
   }
 }
 
-function facilityMenuText(facilityName) {
+function facilityMenuText(facilityName, isLab = false) {
   return [
     `🏥 *LifeDrop: ${facilityName}*`,
     '',
@@ -1421,6 +1429,7 @@ function facilityMenuText(facilityName) {
     '• *requests*: open blood requests for your facility',
     '• Send a donor\'s code, e.g. *LD-48213*: confirm their donation (check their ID card first)',
     '• *results LD-48213*: record the blood group and screening outcome',
+    ...(isLab ? ['• Send a free-test booking code, e.g. *LT-12345*: check the donor in and confirm their blood group'] : []),
     '',
     'Never send infection test results through LifeDrop.'
   ].join('\n');
@@ -1450,7 +1459,7 @@ async function handleFacilityMessage(from, text) {
     return true;
   }
 
-  await sendMessage(from, facilityMenuText(facility.name));
+  await sendMessage(from, facilityMenuText(facility.name, facility.does_lab_tests));
   return true;
 }
 
@@ -1472,6 +1481,117 @@ async function sendToFacility(facility, text, templateName, templateParams) {
       return false;
     }
   }
+}
+
+// Free test check-in, step 1: lab staff send the donor's booking code "LT-12345"
+async function handleLabCode(from, code) {
+  const facility = await getPartnerFacility(from);
+  if (!facility || !facility.does_lab_tests) {
+    return sendMessage(from, "This code is for partner lab staff. Please show it at the lab when you come for your free test. 🧪");
+  }
+
+  const appt = await pool.query(
+    `SELECT a.id, a.slot_at, d.name FROM appointments a LEFT JOIN donors d ON d.phone = a.donor_phone
+     WHERE a.code = $1 AND a.status = 'booked' AND a.facility_id = $2 LIMIT 1`,
+    [code, facility.id]
+  );
+  if (appt.rows.length === 0) {
+    return sendMessage(from, `❓ No open booking ${code} at ${facility.name}. It may be used already, cancelled, or booked at another lab. Please check the code with the donor.`);
+  }
+  const a = appt.rows[0];
+  return sendButtons(
+    from,
+    `🔎 *${code}*\n👤 ${a.name || 'Donor'}\n🕒 ${formatTime(a.slot_at)}\n\nPlease check the donor's ID card matches this name. After the blood group test, tap *Confirm + group*.`,
+    [
+      { id: `lt_yes_${a.id}`, title: 'Confirm + group' },
+      { id: `lt_no_${a.id}`, title: "Didn't come" }
+    ]
+  );
+}
+
+// Step 2: confirm (then type the blood group) or mark as no-show
+async function handleLabCodeButton(from, buttonId) {
+  const facility = await getPartnerFacility(from);
+  if (!facility || !facility.does_lab_tests) return;
+  const m = /^lt_(yes|no)_(\d+)$/.exec(buttonId);
+  if (!m) return;
+  const apptId = parseInt(m[2], 10);
+
+  const appt = await pool.query(
+    `SELECT a.id, a.code, a.status, a.donor_phone FROM appointments a WHERE a.id = $1 AND a.facility_id = $2`,
+    [apptId, facility.id]
+  );
+  const a = appt.rows[0];
+  if (!a) return;
+  if (a.status !== 'booked') {
+    return sendMessage(from, `Booking ${a.code} is already marked as *${a.status}*.`);
+  }
+
+  if (m[1] === 'no') {
+    await pool.query(`UPDATE appointments SET status = 'no_show' WHERE id = $1`, [a.id]);
+    await sendMessage(from, `Noted: ${a.code} did not come.`);
+    try {
+      await sendMessage(a.donor_phone, `We missed you at ${facility.name} for your free blood test. No problem! Reply *4* any time to book a new time. 🧪`);
+    } catch (err) {
+      console.warn('Could not send no-show note (likely outside 24h window):', err.response?.data?.error?.message || err.message);
+    }
+    return;
+  }
+
+  sessions[from] = { step: 'lab_blood_group', data: { apptId: a.id, code: a.code }, aiAttempts: 0 };
+  return sendMessage(from, `🧪 *${a.code}*: type the blood group you found, e.g. O+ or AB-.\n\nReply 'cancel' to stop.`);
+}
+
+// Step 3: staff typed the blood group -> donor is confirmed (verified) with the lab's group
+async function handleLabBloodGroup(from, text) {
+  const { apptId, code } = sessions[from].data;
+  if (text.toLowerCase() === 'cancel') {
+    sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
+    return sendMessage(from, "Cancelled. Nothing was saved.");
+  }
+  const bloodGroup = normalizeBloodGroup(text);
+  if (!bloodGroup) {
+    return sendMessage(from, "Please type a blood group like O+, A-, B+ or AB-, or reply 'cancel'.");
+  }
+  sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
+
+  const facility = await getPartnerFacility(from);
+  if (!facility) return;
+  const row = await pool.query(
+    `SELECT a.status, d.id AS donor_id, d.name, d.phone, d.blood_type, d.eligibility_status, d.screening_reasons, d.last_inbound_at,
+       d.on_medication, d.chronic_condition, d.recent_illness, d.recent_tattoo_piercing
+     FROM appointments a JOIN donors d ON d.phone = a.donor_phone WHERE a.id = $1 AND a.facility_id = $2`,
+    [apptId, facility.id]
+  );
+  const donor = row.rows[0];
+  if (!donor) return sendMessage(from, `No registered donor found for ${code}. Please contact the LifeDrop team.`);
+  if (donor.status !== 'booked') return sendMessage(from, `Booking ${code} is already marked as *${donor.status}*.`);
+
+  const { status, reasons } = statusAfterBloodGroupConfirmed(donor);
+  await pool.query(
+    `UPDATE donors SET blood_type = $2, eligibility_status = $3, screening_reasons = $4, verified_at = NOW(), verified_by_facility_id = $5 WHERE id = $1`,
+    [donor.donor_id, bloodGroup, status, reasons, facility.id]
+  );
+  await pool.query(`UPDATE appointments SET status = 'done' WHERE id = $1`, [apptId]);
+
+  const changed = donor.blood_type && donor.blood_type !== 'UNKNOWN' && donor.blood_type !== bloodGroup;
+  await sendMessage(from, `✅ ${donor.name} (${code}) confirmed with blood group *${bloodGroup}*.${changed ? ` (They had registered as ${donor.blood_type}.)` : ''} Thank you!`);
+
+  const donorText = status === 'eligible'
+    ? `✅ Hi ${donor.name}, ${facility.name} has confirmed your blood group: *${bloodGroup}*. You are now a *confirmed* LifeDrop donor and will receive matching blood requests. Thank you! 🩸`
+    : `✅ Hi ${donor.name}, ${facility.name} has confirmed your blood group: *${bloodGroup}*. Our team will review your profile before we send you requests. Thank you! 🩸`;
+  try {
+    await sendMessage(donor.phone, donorText);
+  } catch (err) {
+    try {
+      await sendTemplate(donor.phone, 'blood_group_confirmed', [donor.name, bloodGroup, facility.name]);
+    } catch (templateErr) {
+      console.warn('Could not tell donor about confirmed blood group:', templateErr.response?.data?.error?.message || templateErr.message);
+    }
+  }
+  await notifyCustomerService(
+    `🧪 *Donor Confirmed at Lab*\n\n🏥 *Lab:* ${facility.name}\n👤 *Donor:* ${donor.name} (${donor.phone})\n🔑 *Code:* ${code}\n🩸 *Blood group:* ${bloodGroup}${changed ? ` (was ${donor.blood_type})` : ''}\n📋 *Status:* ${status}`
+  );
 }
 
 // Donation results, step 1: staff send "results LD-48213" for a confirmed donation
@@ -1548,7 +1668,8 @@ async function handleResultButton(from, buttonId) {
   if (!bloodGroup) return;
 
   const matchRow = await pool.query(
-    `SELECT m.confirm_code, m.results_at, d.id AS donor_id, d.name, d.phone, d.blood_type, d.eligibility_status, d.screening_reasons, d.last_inbound_at
+    `SELECT m.confirm_code, m.results_at, d.id AS donor_id, d.name, d.phone, d.blood_type, d.eligibility_status, d.screening_reasons, d.last_inbound_at,
+       d.on_medication, d.chronic_condition, d.recent_illness, d.recent_tattoo_piercing
      FROM matches m JOIN donors d ON d.id = m.donor_id WHERE m.id = $1 AND m.donation_confirmed = TRUE`,
     [matchId]
   );
@@ -1565,12 +1686,7 @@ async function handleResultButton(from, buttonId) {
   );
 
   // Lab-confirmed blood group replaces the self-reported one; "I don't know" donors no longer need review for it
-  let status = donor.eligibility_status;
-  let reasons = donor.screening_reasons || '';
-  if (reasons.split(',').includes('blood_type_unknown')) {
-    reasons = reasons.split(',').filter(r => r && r !== 'blood_type_unknown').join(',');
-    if (status === 'needs_review' && reasons === '') status = 'eligible';
-  }
+  let { status, reasons } = statusAfterBloodGroupConfirmed(donor);
   if (followUp) status = 'on_hold'; // silent pause: no reason is ever sent to the donor
   await pool.query(
     `UPDATE donors SET blood_type = $2, eligibility_status = $3, screening_reasons = $4 WHERE id = $1`,
