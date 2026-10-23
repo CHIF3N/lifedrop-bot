@@ -2,6 +2,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const { Pool } = require('pg');
+const { daysUntilEligible } = require('./deferral');
 
 const app = express();
 app.use(bodyParser.json());
@@ -13,7 +14,8 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const CS_PHONE_NUMBER = process.env.CS_PHONE_NUMBER;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const DONOR_FLOW_ID = process.env.DONOR_FLOW_ID || '1747598403124876';
-const COMMUNITY_LINK = 'https://chat.whatsapp.com/EPIAr0zFQxVEYXru4PmRwF?s=cl&p=a&mlu=4&ilr=4';
+const DONATION_WAIT_DAYS = parseInt(process.env.DONATION_WAIT_DAYS, 10) || 90; // Rest period between confirmed donations
+const COMMUNITY_LINK ='https://chat.whatsapp.com/EPIAr0zFQxVEYXru4PmRwF?s=cl&p=a&mlu=4&ilr=4';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -29,6 +31,8 @@ async function initDb() {
       ALTER TABLE donors ADD COLUMN IF NOT EXISTS email TEXT;
       ALTER TABLE donors ADD COLUMN IF NOT EXISTS last_inbound_at TIMESTAMP;
       ALTER TABLE donors ADD COLUMN IF NOT EXISTS community_link_sent BOOLEAN DEFAULT FALSE;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS last_donation_date DATE;
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS donation_confirmed BOOLEAN;
     `);
     console.log('✅ Database schema verified.');
   } catch (err) {
@@ -70,6 +74,8 @@ app.post('/webhook', async (req, res) => {
           await handleDonorResponse(from, buttonId);
         } else if (buttonId.startsWith('req_followup_')) {
           await handleRequesterFollowUp(from, buttonId);
+        } else if (buttonId.startsWith('donated_')) {
+          await handleDonationConfirmation(from, buttonId);
         } else {
           await handleMessage(from, buttonId);
         }
@@ -79,6 +85,8 @@ app.post('/webhook', async (req, res) => {
           await handleDonorResponse(from, payload);
         } else if (payload.startsWith('req_followup_')) {
           await handleRequesterFollowUp(from, payload);
+        } else if (payload.startsWith('donated_')) {
+          await handleDonationConfirmation(from, payload);
         } else {
           await handleMessage(from, payload);
         }
@@ -160,9 +168,13 @@ async function handleMessage(from, text) {
   switch (session.step) {
     case 'start': {
       session.step = 'menu';
-      const existing = await pool.query('SELECT name FROM donors WHERE phone = $1', [from]);
+      const existing = await pool.query('SELECT name, last_donation_date FROM donors WHERE phone = $1', [from]);
       if (existing.rows.length > 0) {
-        return sendMessage(from, `Welcome back, ${existing.rows[0].name}! 🩸\n\nReply:\n1 - Update my donor info\n2 - Request blood`);
+        const daysLeft = daysUntilEligible(existing.rows[0].last_donation_date, DONATION_WAIT_DAYS);
+        const restLine = daysLeft > 0
+          ? `\n\nThank you for your last donation! ❤️ You're on a rest break. You can donate again in ${daysLeft} day(s). We won't send you requests until then.`
+          : '';
+        return sendMessage(from, `Welcome back, ${existing.rows[0].name}! 🩸${restLine}\n\nReply:\n1 - Update my donor info\n2 - Request blood`);
       }
       return sendMessage(from, "Welcome to LifeDrop 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood");
     }
@@ -338,8 +350,11 @@ async function saveRequestAndMatch(phone, d) {
   const notifyCount = neededUnits + 1;
 
   const matchedDonors = await pool.query(
-    `SELECT id, name, phone, last_inbound_at FROM donors WHERE blood_type = $1 AND city ILIKE $2 AND eligibility_status = 'eligible' LIMIT $3`,
-    [d.blood_type_needed, `%${d.location}%`, notifyCount]
+    `SELECT id, name, phone, last_inbound_at FROM donors
+     WHERE blood_type = $1 AND city ILIKE $2 AND eligibility_status = 'eligible'
+       AND (last_donation_date IS NULL OR last_donation_date <= CURRENT_DATE - $4::int)
+     LIMIT $3`,
+    [d.blood_type_needed, `%${d.location}%`, notifyCount, DONATION_WAIT_DAYS]
   );
 
   if (matchedDonors.rows.length === 0) {
@@ -478,6 +493,14 @@ async function handleDonorResponse(from, buttonId) {
     return sendMessage(from, "No problem, thanks for letting us know. We'll reach out next time there's a match.");
   }
 
+  // Donor already gave blood recently (e.g. tapped an older alert): keep them resting
+  const donorRest = await pool.query(`SELECT last_donation_date FROM donors WHERE phone = $1`, [from]);
+  const daysLeft = daysUntilEligible(donorRest.rows[0]?.last_donation_date, DONATION_WAIT_DAYS);
+  if (daysLeft > 0) {
+    await pool.query(`UPDATE matches SET response = 'no' WHERE id = $1`, [matchId]);
+    return sendMessage(from, `Thank you for wanting to help! 🙏 You donated recently, so your body needs rest. You can donate again in ${daysLeft} day(s). We'll reach out after that.`);
+  }
+
   const neededUnits = units_needed || 1;
   const acceptedCountResult = await pool.query(
     `SELECT COUNT(*) FROM matches WHERE request_id = $1 AND response = 'yes'`,
@@ -499,6 +522,7 @@ async function handleDonorResponse(from, buttonId) {
     requester_phone,
     `Good news! ${donorName} (${from}) has agreed to donate ${blood_type_needed}${hospital_name ? ' at ' + hospital_name : ''} in ${location}. Please reach out to coordinate directly.`
   );
+  await sendDonationConfirmButtons(from, requester_phone, donorName, matchId);
 
   const newAcceptedCount = acceptedSoFar + 1;
   if (newAcceptedCount >= neededUnits) {
@@ -512,6 +536,72 @@ async function handleDonorResponse(from, buttonId) {
     }
     await pool.query(`UPDATE requests SET status = 'fulfilled' WHERE id = $1`, [request_id]);
   }
+}
+
+// "Did the donation happen?" buttons, sent right after a donor accepts (both chats are inside the 24h window then).
+// The buttons stay in the chat, so either side can tap them later; a tap is an inbound message, so our reply always delivers.
+async function sendDonationConfirmButtons(donorPhone, requesterPhone, donorName, matchId) {
+  try {
+    await sendButtons(donorPhone, "After you have donated, please tap below. This lets us give you a rest period before we ask you again. 🩸", [
+      { id: `donated_yes_${matchId}`, title: 'Yes, I donated' },
+      { id: `donated_no_${matchId}`, title: "It didn't happen" }
+    ]);
+  } catch (err) {
+    console.warn('Could not send donation confirmation to donor:', err.response?.data?.error?.message || err.message);
+  }
+  try {
+    await sendButtons(requesterPhone, `Once ${donorName} has donated, please tap below to confirm. Did the donation happen?`, [
+      { id: `donated_yes_${matchId}`, title: 'Donation done' },
+      { id: `donated_no_${matchId}`, title: "It didn't happen" }
+    ]);
+  } catch (err) {
+    console.warn('Could not send donation confirmation to requester:', err.response?.data?.error?.message || err.message);
+  }
+}
+
+// Donation Confirmation Handler (sets the donor's rest period on "Yes")
+async function handleDonationConfirmation(from, buttonId) {
+  const isYes = buttonId.startsWith('donated_yes_');
+  const matchId = buttonId.replace('donated_yes_', '').replace('donated_no_', '');
+
+  const matchRow = await pool.query(
+    `SELECT m.donor_id, m.donation_confirmed, d.name AS donor_name, d.phone AS donor_phone, r.requester_phone
+     FROM matches m JOIN donors d ON d.id = m.donor_id JOIN requests r ON r.id = m.request_id WHERE m.id = $1`,
+    [matchId]
+  );
+  if (matchRow.rows.length === 0) return;
+  const { donor_id, donation_confirmed, donor_name, donor_phone, requester_phone } = matchRow.rows[0];
+
+  if (from !== donor_phone && from !== requester_phone) return;
+  if (donation_confirmed === true) {
+    return sendMessage(from, "This donation is already recorded. Thank you! 🙏");
+  }
+
+  if (!isYes) {
+    await pool.query(`UPDATE matches SET donation_confirmed = FALSE WHERE id = $1`, [matchId]);
+    await sendMessage(from, "Thanks for letting us know. If you still need help, message us anytime.");
+    return notifyCustomerService(
+      `❌ *Donation Did Not Happen*\n\n👤 *Donor:* ${donor_name} (${donor_phone})\n📞 *Requester:* ${requester_phone}\n🆔 *Match ID:* ${matchId}\n*Reported by:* ${from === donor_phone ? 'Donor' : 'Requester'}`
+    );
+  }
+
+  await pool.query(`UPDATE matches SET donation_confirmed = TRUE WHERE id = $1`, [matchId]);
+  await pool.query(`UPDATE donors SET last_donation_date = CURRENT_DATE WHERE id = $1`, [donor_id]);
+
+  const donorThanks = `Thank you for donating blood, ${donor_name}! ❤️ You may have saved a life. Your body needs time to recover, so we won't ask you to donate again for the next ${DONATION_WAIT_DAYS} days. We'll reach out after that.`;
+  if (from === donor_phone) {
+    await sendMessage(from, donorThanks);
+  } else {
+    await sendMessage(from, "Thank you for confirming! We're glad the donation happened. Wishing the patient a quick recovery. 🙏");
+    try {
+      await sendMessage(donor_phone, donorThanks);
+    } catch (err) {
+      console.warn('Could not thank donor (likely outside 24h window):', err.response?.data?.error?.message || err.message);
+    }
+  }
+  await notifyCustomerService(
+    `✅ *Donation Confirmed*\n\n👤 *Donor:* ${donor_name} (${donor_phone})\n📞 *Requester:* ${requester_phone}\n🆔 *Match ID:* ${matchId}\n⏳ *Next eligible in:* ${DONATION_WAIT_DAYS} days`
+  );
 }
 
 // Meta API Sender Wrappers
