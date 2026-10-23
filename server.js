@@ -57,6 +57,8 @@ async function initDb() {
       ALTER TABLE donors ADD COLUMN IF NOT EXISTS location_updated_at TIMESTAMP;
       ALTER TABLE requests ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
       ALTER TABLE requests ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS town TEXT;
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS town TEXT;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS confirm_code TEXT;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS confirmed_by_facility_id INTEGER;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS responded_at TIMESTAMP;
@@ -103,11 +105,26 @@ async function initDb() {
     `);
     if (SEED_DEMO_LABS) await seedDemoLabs();
     console.log('✅ Database schema verified.');
+    await backfillDonorTowns();
   } catch (err) {
     console.warn('⚠️ Database schema verification warning:', err.message);
   }
 }
 initDb();
+
+// Fill donors.town (clean town name) for donors saved before it existed. Pin first, then typed city.
+// Rows that still can't be placed stay NULL and keep matching on raw city text.
+async function backfillDonorTowns() {
+  const rows = await pool.query(`SELECT id, city, lat, lng FROM donors WHERE town IS NULL`);
+  let filled = 0;
+  for (const donor of rows.rows) {
+    const town = (donor.lat != null && geo.nearestTown(donor.lat, donor.lng)) || geo.findTown(donor.city);
+    if (!town) continue;
+    await pool.query(`UPDATE donors SET town = $2 WHERE id = $1`, [donor.id, town.name]);
+    filled++;
+  }
+  if (rows.rows.length > 0) console.log(`📍 Donor towns: filled ${filled} of ${rows.rows.length} missing.`);
+}
 
 // FICTIONAL labs for testing the booking flow on a test number. These are NOT real partners.
 // Only runs when SEED_DEMO_LABS=true; never set that on the live bot.
@@ -379,8 +396,25 @@ async function handleMessage(from, text) {
 
   // New donor: waiting for a location pin (handleLocation continues when a pin arrives)
   if (session.step === 'donor_pin') {
-    if (text.toLowerCase() === 'skip') return continueOnboarding(from);
-    return sendLocationRequest(from, "Please tap *Send location* to share where you are, or reply 'skip'.");
+    if (text.toLowerCase() !== 'skip') {
+      return sendLocationRequest(from, "Please tap *Send location* to share where you are, or reply 'skip'.");
+    }
+    // No pin and we couldn't place their typed city: ask once which town they meant
+    if (session.data.citySuggestions?.length > 0) {
+      session.step = 'donor_town_confirm';
+      return askTownConfirm(from, session.data.city, session.data.citySuggestions);
+    }
+    return continueOnboarding(from);
+  }
+
+  // New donor answering "Did you mean ...?" for their city
+  if (session.step === 'donor_town_confirm') {
+    const picked = pickedTown(text);
+    if (picked) {
+      await pool.query(`UPDATE donors SET town = $2 WHERE phone = $1`, [from, picked]);
+      await sendMessage(from, `📍 Saved: ${picked}. Thank you!`);
+    }
+    return continueOnboarding(from);
   }
 
   // Free test offer / lab list is open: anything typed except a pick moves on
@@ -456,11 +490,36 @@ async function handleMessage(from, text) {
       session.step = 'request_location';
       return sendLocationRequest(from, "Where is the patient? 📍 Tap *Send location* (the hospital's pin is best), or type the city/town.");
 
-    case 'request_location':
-      // A pin is handled in handleLocation; typed text is a town name
+    case 'request_location': {
+      // A pin is handled in handleLocation; typed text is matched to a known town (typos and neighbourhoods allowed)
+      const resolved = geo.resolveTown(text);
+      if (resolved.town) return setRequestTown(from, resolved.town.name, geo.placeLabel(resolved));
+      if (resolved.suggestions.length > 0 && !session.data.townRetry) {
+        session.data.typedLocation = text;
+        session.step = 'request_town_confirm';
+        return askTownConfirm(from, text, resolved.suggestions);
+      }
+      if (!session.data.townRetry) {
+        session.data.townRetry = true;
+        return sendLocationRequest(from, `We couldn't find "${truncate(text, 40)}" 🤔\nTap *Send location*, or type the main town (e.g. Douala, Yaounde, Buea, Bamenda).`);
+      }
+      // Second miss: never block a blood request; fall back to matching on the text as typed
       session.data.location = text;
+      session.data.town = null;
       session.step = 'request_hospital';
       return sendMessage(from, "Which hospital or clinic? (enter hospital name, or reply 'skip')");
+    }
+
+    case 'request_town_confirm': {
+      const picked = pickedTown(text);
+      if (picked) return setRequestTown(from, picked, picked);
+      session.data.townRetry = true;
+      session.step = 'request_location';
+      if (text === 'town_none') {
+        return sendLocationRequest(from, "No problem. Tap *Send location*, or type the main town (e.g. Douala, Yaounde, Buea, Bamenda).");
+      }
+      return handleMessage(from, text); // They typed a new place instead of tapping a button
+    }
 
     case 'request_hospital':
       session.data.hospital_name = text.toLowerCase() === 'skip' ? null : text;
@@ -534,6 +593,12 @@ async function handleMessage(from, text) {
 async function handleFlowSubmission(from, flowData) {
   try {
     const screening = await saveDonor(from, flowData);
+    // Clean town from the typed city (typos, neighbourhoods); a pin-based town is kept if the city can't be placed
+    const cityMatch = geo.resolveTown(flowData.city);
+    await pool.query(
+      `UPDATE donors SET town = COALESCE($2, CASE WHEN lat IS NOT NULL THEN town END) WHERE phone = $1`,
+      [from, cityMatch.town?.name || null]
+    );
 
     const countResult = await pool.query(`SELECT COUNT(*) FROM donors`);
     const totalDonors = countResult.rows[0].count;
@@ -550,7 +615,10 @@ async function handleFlowSubmission(from, flowData) {
     // Next: location pin -> free test offer -> feedback (see continueOnboarding)
     sessions[from] = {
       step: 'donor_pin',
-      data: { donorName: flowData.name, unknownType: flowData.blood_type === 'UNKNOWN', onboarding: true },
+      data: {
+        donorName: flowData.name, unknownType: flowData.blood_type === 'UNKNOWN', onboarding: true,
+        city: flowData.city, citySuggestions: cityMatch.town ? [] : cityMatch.suggestions
+      },
       aiAttempts: 0
     };
     if (screening.status === 'not_eligible') return askFeedback(from);
@@ -559,6 +627,28 @@ async function handleFlowSubmission(from, flowData) {
     console.error('Error handling flow submission:', err);
     await sendMessage(from, "Thank you for submitting! Your details have been received.");
   }
+}
+
+// "Did you mean ...?" buttons for a place we couldn't match for sure (ids: town_<Name>, town_none)
+async function askTownConfirm(from, typed, suggestions) {
+  const buttons = suggestions.slice(0, 2).map(name => ({ id: `town_${name}`, title: truncate(name, 20) }));
+  buttons.push({ id: 'town_none', title: 'None of these' });
+  return sendButtons(from, `We couldn't find "${truncate(typed, 40)}" 🤔 Did you mean:`, buttons);
+}
+
+// Town name from a "Did you mean" button, or null
+function pickedTown(buttonId) {
+  if (!buttonId.startsWith('town_') || buttonId === 'town_none') return null;
+  return geo.townByName(buttonId.slice('town_'.length))?.name || null;
+}
+
+// Requester's place is known: save the clean town and move on to the hospital question
+async function setRequestTown(from, townName, label) {
+  const session = sessions[from];
+  session.data.town = townName;
+  session.data.location = label;
+  session.step = 'request_hospital';
+  return sendMessage(from, `📍 ${label}. Which hospital or clinic? (enter hospital name, or reply 'skip')`);
 }
 
 // After the location step: "Don't know" donors go straight to the lab list, others get an optional offer
@@ -596,9 +686,10 @@ async function handleLocation(from, loc) {
   const town = geo.nearestTown(loc.lat, loc.lng);
   const nearLine = town ? ` (near ${town.name})` : '';
 
-  if (session?.step === 'request_location') {
+  if (session?.step === 'request_location' || session?.step === 'request_town_confirm') {
     session.data.lat = loc.lat;
     session.data.lng = loc.lng;
+    session.data.town = town?.name || null;
     session.data.location = town?.name || loc.address || loc.name || 'Shared location';
     session.step = 'request_hospital';
     const hospitalHint = loc.name ? ` (your pin says *${loc.name}*)` : '';
@@ -606,13 +697,13 @@ async function handleLocation(from, loc) {
   }
 
   const updated = await pool.query(
-    `UPDATE donors SET lat = $2, lng = $3, location_updated_at = NOW() WHERE phone = $1 RETURNING id`,
-    [from, loc.lat, loc.lng]
+    `UPDATE donors SET lat = $2, lng = $3, town = COALESCE($4, town), location_updated_at = NOW() WHERE phone = $1 RETURNING id`,
+    [from, loc.lat, loc.lng, town?.name || null]
   );
   if (updated.rows.length === 0) {
     return sendMessage(from, "Thanks! To use your location, first reply *1* to register as a donor or *2* to request blood.");
   }
-  if (session?.step === 'donor_pin') {
+  if (session?.step === 'donor_pin' || session?.step === 'donor_town_confirm') {
     await sendMessage(from, `📍 Location saved${nearLine}. Thank you!`);
     return continueOnboarding(from);
   }
@@ -682,8 +773,8 @@ async function sendCommunityLinkIfNeeded(phone) {
 // Request Matching Engine
 async function saveRequestAndMatch(phone, d) {
   const result = await pool.query(
-    `INSERT INTO requests (requester_phone, blood_type_needed, location, hospital_name, units_needed, urgency, lat, lng) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-    [phone, d.blood_type_needed, d.location, d.hospital_name, d.units_needed, d.urgency, d.lat ?? null, d.lng ?? null]
+    `INSERT INTO requests (requester_phone, blood_type_needed, location, hospital_name, units_needed, urgency, lat, lng, town) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+    [phone, d.blood_type_needed, d.location, d.hospital_name, d.units_needed, d.urgency, d.lat ?? null, d.lng ?? null, d.town || null]
   );
   const requestId = result.rows[0].id;
   const neededUnits = d.units_needed || 1;
@@ -726,13 +817,13 @@ async function saveRequestAndMatch(phone, d) {
 }
 
 // Donor search: nearest pinned donors first (rings up to geo.MAX_RADIUS_KM), then donors without a pin
-// whose typed city is the request's town or any known town in reach. Unknown town + no pin = old city text match.
+// whose clean town is in reach (raw city text only for donors we couldn't place). No pin + unknown town = old text match.
 async function findMatchingDonors(d, limit) {
   const baseFilter = `blood_type = $1 AND eligibility_status = 'eligible'
     AND (deferred_until IS NULL OR deferred_until <= CURRENT_DATE)
     AND (last_donation_date IS NULL OR last_donation_date <= CURRENT_DATE - (CASE WHEN gender = 'male' THEN $2 ELSE $3 END)::int)`;
   const baseParams = [d.blood_type_needed, DONATION_WAIT_DAYS_MALE, DONATION_WAIT_DAYS_FEMALE];
-  const point = d.lat != null ? { lat: d.lat, lng: d.lng } : geo.findTown(d.location);
+  const point = d.lat != null ? { lat: d.lat, lng: d.lng } : geo.townByName(d.town) || geo.findTown(d.location);
   let donors = [];
 
   if (point) {
@@ -749,13 +840,14 @@ async function findMatchingDonors(d, limit) {
   if (donors.length < limit) {
     const towns = point ? geo.townsWithin(point.lat, point.lng, geo.MAX_RADIUS_KM) : [];
     const patterns = [...new Set([d.location, ...towns])].filter(Boolean).map(t => `%${t}%`);
+    const cityFilter = point ? '(town = ANY($4) OR (town IS NULL AND city ILIKE ANY($5)))' : '(town = ANY($4) OR city ILIKE ANY($5))';
     const byCity = await pool.query(
       `SELECT id, name, phone, last_inbound_at, NULL::float AS dist_km FROM donors
-       WHERE ${baseFilter} AND city ILIKE ANY($4) AND NOT (id = ANY($5))
+       WHERE ${baseFilter} AND ${cityFilter} AND NOT (id = ANY($6))
          ${point ? 'AND lat IS NULL' : ''}
-       ORDER BY (city ILIKE $6) DESC
-       LIMIT $7`,
-      [...baseParams, patterns, donors.map(x => x.id), `%${d.location}%`, limit - donors.length]
+       ORDER BY (town IS NOT DISTINCT FROM $7) DESC, (city ILIKE $8) DESC
+       LIMIT $9`,
+      [...baseParams, towns, patterns, donors.map(x => x.id), d.town || null, `%${d.location}%`, limit - donors.length]
     );
     donors = donors.concat(byCity.rows);
   }
@@ -1277,14 +1369,14 @@ async function handleLabOffer(from, buttonId) {
 
 // Shows the closest partner labs as a WhatsApp list. Returns false if there was nothing to pick.
 async function offerLabs(from) {
-  const donorRow = await pool.query(`SELECT name, city, lat, lng FROM donors WHERE phone = $1`, [from]);
+  const donorRow = await pool.query(`SELECT name, city, town, lat, lng FROM donors WHERE phone = $1`, [from]);
   const donor = donorRow.rows[0];
   if (!donor) {
     await sendMessage(from, "Free blood tests are for registered donors. Reply *1* to register first. 🩸");
     return false;
   }
 
-  const point = donor.lat != null ? { lat: donor.lat, lng: donor.lng } : geo.findTown(donor.city);
+  const point = donor.lat != null ? { lat: donor.lat, lng: donor.lng } : geo.townByName(donor.town) || geo.findTown(donor.city);
   const labs = point
     ? await pool.query(
         `SELECT * FROM (
