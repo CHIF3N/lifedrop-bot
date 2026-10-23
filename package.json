@@ -4,7 +4,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/deferral.test.js test/screening.test.js test/results.test.js"
+    "test": "node --test test/deferral.test.js test/screening.test.js test/results.test.js test/reports.test.js"
   },
   "dependencies": {
     "express": "^4.19.2",

@@ -6,6 +6,7 @@ const { Pool } = require('pg');
 const { daysUntilEligible } = require('./deferral');
 const { evaluateScreening } = require('./screening');
 const { parseResultsRequest, normalizeBloodGroup, parseResultButton, neutralResultMessage } = require('./results');
+const { formatTime, splitReport, formatStatsReport, dailySummaryParams } = require('./reports');
 
 const app = express();
 app.use(bodyParser.json());
@@ -16,7 +17,8 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const CS_PHONE_NUMBER = process.env.CS_PHONE_NUMBER;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const DONOR_FLOW_ID = process.env.DONOR_FLOW_ID || '1747598403124876';
+const REPORT_KEY = process.env.REPORT_KEY; // Secret for the /reports/daily endpoint (called by an external cron)
+const DONOR_FLOW_ID =process.env.DONOR_FLOW_ID || '1747598403124876';
 // Rest period between confirmed whole-blood donations (WHO minimum: 12 weeks men, 16 weeks women)
 const DONATION_WAIT_DAYS_MALE = parseInt(process.env.DONATION_WAIT_DAYS_MALE, 10) || 90;
 const DONATION_WAIT_DAYS_FEMALE = parseInt(process.env.DONATION_WAIT_DAYS_FEMALE, 10) || 120;
@@ -46,6 +48,10 @@ async function initDb() {
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS donation_confirmed BOOLEAN;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS confirm_code TEXT;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS confirmed_by_facility_id INTEGER;
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS responded_at TIMESTAMP;
+      ALTER TABLE matches ADD COLUMN IF NOT EXISTS donation_confirmed_at TIMESTAMP;
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+      ALTER TABLE donors ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_blood_group TEXT;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_outcome TEXT;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS results_at TIMESTAMP;
@@ -137,7 +143,10 @@ app.post('/webhook', async (req, res) => {
       } else {
         const text = message.text?.body?.trim() || '';
         const resultsCode = parseResultsRequest(text);
-        if (resultsCode) {
+        const statsMatch = isSupportPhone(from) ? /^(?:stats|report)(?:\s+(\d{1,3}))?$/i.exec(text) : null;
+        if (statsMatch) {
+          await sendStatsReport(from, Math.min(parseInt(statsMatch[1], 10) || 7, 365));
+        } else if (resultsCode) {
           await handleResultsRequest(from, resultsCode);
         } else if (/^LD-?\s?\d{5}$/i.test(text)) {
           await handleFacilityCode(from, text);
@@ -154,16 +163,108 @@ app.post('/webhook', async (req, res) => {
 
 // Safe Customer Service Notifications (Never crashes requester flows)
 async function notifyCustomerService(text) {
+  const report = `${text}\n\n🕒 ${formatTime()}`;
   if (!CS_PHONE_NUMBER) {
-    console.log('[CS Log (No Phone Configured)]:\n', text);
+    console.log('[CS Log (No Phone Configured)]:\n', report);
+    return;
+  }
+  const cleanNumber = CS_PHONE_NUMBER.replace(/\D/g, '');
+  try {
+    await sendMessage(cleanNumber, report);
+  } catch (err) {
+    // Usually the support phone is outside its 24h window: fall back to the approved ops report template
+    try {
+      const { title, details } = splitReport(report);
+      await sendTemplate(cleanNumber, 'lifedrop_ops_report', [title, details]);
+    } catch (templateErr) {
+      console.warn('⚠️ Could not deliver CS message or lifedrop_ops_report template:', templateErr.response?.data?.error?.message || templateErr.message);
+      console.log('📌 CS Alert Fallback Output:\n', report);
+    }
+  }
+}
+
+const isSupportPhone = (phone) => Boolean(CS_PHONE_NUMBER) && phone === CS_PHONE_NUMBER.replace(/\D/g, '');
+
+// Analytics numbers for the last N days (donor counts are current totals)
+async function getStats(days) {
+  const since = [days];
+  const [donors, bloodTypes, requests, topLocations, matches, donations, facilities, waitlist] = await Promise.all([
+    pool.query(
+      `SELECT COUNT(*) AS total,
+         COUNT(*) FILTER (WHERE created_at >= NOW() - $1 * INTERVAL '1 day') AS new,
+         COUNT(*) FILTER (WHERE eligibility_status = 'eligible'
+           AND (deferred_until IS NULL OR deferred_until <= CURRENT_DATE)
+           AND (last_donation_date IS NULL OR last_donation_date <= CURRENT_DATE - (CASE WHEN gender = 'male' THEN $2 ELSE $3 END)::int)) AS ready,
+         COUNT(*) FILTER (WHERE last_donation_date > CURRENT_DATE - (CASE WHEN gender = 'male' THEN $2 ELSE $3 END)::int) AS resting,
+         COUNT(*) FILTER (WHERE eligibility_status = 'eligible' AND deferred_until > CURRENT_DATE) AS waiting,
+         COUNT(*) FILTER (WHERE eligibility_status = 'needs_review') AS needs_review,
+         COUNT(*) FILTER (WHERE eligibility_status IN ('needs_update', 'on_hold')) AS paused,
+         COUNT(*) FILTER (WHERE eligibility_status = 'not_eligible') AS not_eligible,
+         COUNT(*) FILTER (WHERE verified_at IS NOT NULL) AS verified
+       FROM donors`,
+      [days, DONATION_WAIT_DAYS_MALE, DONATION_WAIT_DAYS_FEMALE]
+    ),
+    pool.query(`SELECT blood_type, COUNT(*) AS count FROM donors GROUP BY blood_type ORDER BY COUNT(*) DESC`),
+    pool.query(
+      `SELECT COUNT(*) AS total,
+         COUNT(*) FILTER (WHERE urgency = 'Emergency') AS emergency,
+         COUNT(*) FILTER (WHERE status = 'fulfilled') AS fulfilled,
+         COUNT(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM matches m WHERE m.request_id = r.id)) AS no_match
+       FROM requests r WHERE created_at >= NOW() - $1 * INTERVAL '1 day'`,
+      since
+    ),
+    pool.query(
+      `SELECT lower(trim(location)) AS location, COUNT(*) AS count FROM requests
+       WHERE created_at >= NOW() - $1 * INTERVAL '1 day' GROUP BY 1 ORDER BY 2 DESC LIMIT 5`,
+      since
+    ),
+    pool.query(
+      `SELECT COUNT(*) AS contacted,
+         COUNT(*) FILTER (WHERE response = 'yes') AS yes,
+         COUNT(*) FILTER (WHERE response = 'no') AS no,
+         COUNT(*) FILTER (WHERE response = 'not_needed') AS not_needed,
+         COUNT(*) FILTER (WHERE response IS NULL) AS no_reply,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM responded_at - contacted_at) / 60)
+           FILTER (WHERE response = 'yes' AND responded_at IS NOT NULL) AS median_minutes_to_yes
+       FROM matches WHERE contacted_at >= NOW() - $1 * INTERVAL '1 day'`,
+      since
+    ),
+    pool.query(
+      `SELECT COUNT(*) FILTER (WHERE donation_confirmed_at >= NOW() - $1 * INTERVAL '1 day') AS confirmed,
+         COUNT(*) FILTER (WHERE donation_confirmed_at >= NOW() - $1 * INTERVAL '1 day' AND confirmed_by_facility_id IS NOT NULL) AS by_facility,
+         COUNT(*) FILTER (WHERE donation_confirmed_at >= NOW() - $1 * INTERVAL '1 day' AND confirmed_by_facility_id IS NULL) AS self_reported,
+         COUNT(*) FILTER (WHERE results_at >= NOW() - $1 * INTERVAL '1 day') AS results
+       FROM matches`,
+      since
+    ),
+    pool.query(`SELECT COUNT(*) FILTER (WHERE is_partner) AS partners FROM facilities`),
+    pool.query(`SELECT COUNT(*) AS home_lab FROM feature_interest WHERE feature = 'home_lab_test'`)
+  ]);
+  return {
+    donors: donors.rows[0], bloodTypes: bloodTypes.rows, requests: requests.rows[0], topLocations: topLocations.rows,
+    matches: matches.rows[0], donations: donations.rows[0], facilities: facilities.rows[0], waitlist: waitlist.rows[0]
+  };
+}
+
+// Support phone texts "stats" or "stats 30": the reply is inside its 24h window, so a plain message works
+async function sendStatsReport(to, days) {
+  const stats = await getStats(days);
+  return sendMessage(to, formatStatsReport(stats, days));
+}
+
+// Daily summary for the support line: full text if its window is open, else the lifedrop_daily_summary template
+async function sendDailySummary() {
+  const stats = await getStats(1);
+  const text = formatStatsReport(stats, 1);
+  if (!CS_PHONE_NUMBER) {
+    console.log('[Daily summary (No CS Phone Configured)]:\n', text);
     return;
   }
   const cleanNumber = CS_PHONE_NUMBER.replace(/\D/g, '');
   try {
     await sendMessage(cleanNumber, text);
   } catch (err) {
-    console.warn('⚠️ Could not deliver CS message (check 24h window or phone ID):', err.response?.data?.error?.message || err.message);
-    console.log('📌 CS Alert Fallback Output:\n', text);
+    await sendTemplate(cleanNumber, 'lifedrop_daily_summary', dailySummaryParams(stats));
   }
 }
 
@@ -464,12 +565,18 @@ async function saveRequestAndMatch(phone, d) {
   );
 
   if (matchedDonors.rows.length === 0) {
+    // How many donors of this group the area has at all, to tell "nobody registered" from "everyone resting"
+    const areaPool = await pool.query(
+      `SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE eligibility_status = 'eligible') AS eligible
+       FROM donors WHERE blood_type = $1 AND city ILIKE $2`,
+      [d.blood_type_needed, `%${d.location}%`]
+    );
     await notifyCustomerService(
-      `⚠️ *NO DONOR MATCH FOUND!*\n\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'Not specified'}\n⚡ *Urgency:* ${d.urgency}\n📞 *Requester Phone:* ${phone}\n\n*Action Required:* Manual donor outreach needed.`
+      `⚠️ *NO DONOR MATCH FOUND!*\n\n🆔 *Request:* #${requestId}\n👥 *Same blood group in this area:* ${areaPool.rows[0].total} registered, ${areaPool.rows[0].eligible} screened eligible (all resting or waiting)\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'Not specified'}\n⚡ *Urgency:* ${d.urgency}\n📞 *Requester Phone:* ${phone}\n\n*Action Required:* Manual donor outreach needed.`
     );
   } else {
     await notifyCustomerService(
-      `🩸 *New Blood Request Logged*\n\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'N/A'}\n⚡ *Urgency:* ${d.urgency}\n👥 *Donors Contacted:* ${matchedDonors.rows.length}\n📞 *Requester Phone:* ${phone}`
+      `🩸 *New Blood Request Logged*\n\n🆔 *Request:* #${requestId}\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'N/A'}\n⚡ *Urgency:* ${d.urgency}\n👥 *Donors Contacted:* ${matchedDonors.rows.length}\n📞 *Requester Phone:* ${phone}`
     );
 
     for (const donor of matchedDonors.rows) {
@@ -586,16 +693,16 @@ async function handleDonorResponse(from, buttonId) {
   const matchId = buttonId.replace('match_yes_', '').replace('match_no_', '');
 
   const matchRow = await pool.query(
-    `SELECT m.request_id, m.response, r.units_needed, r.requester_phone, r.blood_type_needed, r.location, r.hospital_name     FROM matches m JOIN requests r ON r.id = m.request_id WHERE m.id = $1`,
+    `SELECT m.request_id, m.response, m.contacted_at, r.units_needed, r.requester_phone, r.blood_type_needed, r.location, r.hospital_name, r.urgency     FROM matches m JOIN requests r ON r.id = m.request_id WHERE m.id = $1`,
     [matchId]
   );
   if (matchRow.rows.length === 0) return;
-  const { request_id, response: existingResponse, units_needed, requester_phone, blood_type_needed, location, hospital_name } = matchRow.rows[0];
+  const { request_id, response: existingResponse, contacted_at, units_needed, requester_phone, blood_type_needed, location, hospital_name, urgency } = matchRow.rows[0];
 
   if (existingResponse) return;
 
   if (!isYes) {
-    await pool.query(`UPDATE matches SET response = 'no' WHERE id = $1`, [matchId]);
+    await pool.query(`UPDATE matches SET response = 'no', responded_at = NOW() WHERE id = $1`, [matchId]);
     return sendMessage(from, "No problem, thanks for letting us know. We'll reach out next time there's a match.");
   }
 
@@ -603,7 +710,7 @@ async function handleDonorResponse(from, buttonId) {
   const donorRest = await pool.query(`SELECT last_donation_date, gender FROM donors WHERE phone = $1`, [from]);
   const daysLeft = daysUntilEligible(donorRest.rows[0]?.last_donation_date, donationWaitDays(donorRest.rows[0]?.gender));
   if (daysLeft > 0) {
-    await pool.query(`UPDATE matches SET response = 'no' WHERE id = $1`, [matchId]);
+    await pool.query(`UPDATE matches SET response = 'no', responded_at = NOW() WHERE id = $1`, [matchId]);
     return sendMessage(from, `Thank you for wanting to help! 🙏 You donated recently, so your body needs rest. You can donate again in ${daysLeft} day(s). We'll reach out after that.`);
   }
 
@@ -615,12 +722,12 @@ async function handleDonorResponse(from, buttonId) {
   const acceptedSoFar = parseInt(acceptedCountResult.rows[0].count, 10);
 
   if (acceptedSoFar >= neededUnits) {
-    await pool.query(`UPDATE matches SET response = 'not_needed' WHERE id = $1`, [matchId]);
+    await pool.query(`UPDATE matches SET response = 'not_needed', responded_at = NOW() WHERE id = $1`, [matchId]);
     return sendMessage(from, "Thanks so much for being ready to help! We have already secured enough donors for this request. We will reach out next time there is a match. 🙏");
   }
 
   const confirmCode = await generateConfirmCode();
-  await pool.query(`UPDATE matches SET response = 'yes', confirm_code = $2 WHERE id = $1`, [matchId, confirmCode]);
+  await pool.query(`UPDATE matches SET response = 'yes', responded_at = NOW(), confirm_code = $2 WHERE id = $1`, [matchId, confirmCode]);
   const donorInfo = await pool.query(`SELECT name FROM donors WHERE phone = $1`, [from]);
   const donorName = donorInfo.rows[0]?.name || 'A donor';
 
@@ -632,6 +739,10 @@ async function handleDonorResponse(from, buttonId) {
   await sendDonationConfirmButtons(from, requester_phone, donorName, matchId);
 
   const newAcceptedCount = acceptedSoFar + 1;
+  const minutesToReply = contacted_at ? Math.max(0, Math.round((Date.now() - new Date(contacted_at).getTime()) / 60000)) : null;
+  await notifyCustomerService(
+    `🙋 *Donor Accepted*\n\n🆔 *Request:* #${request_id}\n👤 *Donor:* ${donorName} (${from})\n🩸 *Blood:* ${blood_type_needed}\n📍 *Location:* ${location}\n🏥 *Hospital:* ${hospital_name || 'N/A'}\n⚡ *Urgency:* ${urgency || 'N/A'}\n📞 *Requester:* ${requester_phone}\n🔑 *Code:* ${confirmCode}\n⏱️ *Replied after:* ${minutesToReply != null ? minutesToReply + ' min' : 'N/A'}\n✅ *Accepted:* ${newAcceptedCount} of ${neededUnits} unit(s)`
+  );
   if (newAcceptedCount >= neededUnits) {
     const pendingMatches = await pool.query(
       `SELECT m.id, d.phone FROM matches m JOIN donors d ON d.id = m.donor_id WHERE m.request_id = $1 AND m.response IS NULL`,
@@ -642,6 +753,9 @@ async function handleDonorResponse(from, buttonId) {
       await sendMessage(pm.phone, "Thanks so much for offering to help! We've secured enough donors for this request. We will contact you next time there is a match. 🙏");
     }
     await pool.query(`UPDATE requests SET status = 'fulfilled' WHERE id = $1`, [request_id]);
+    await notifyCustomerService(
+      `🎉 *Request Fulfilled*\n\n🆔 *Request:* #${request_id}\n🩸 *Blood:* ${blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${location}\n📞 *Requester:* ${requester_phone}\n🔕 *Other donors told not needed:* ${pendingMatches.rows.length}`
+    );
   }
 }
 
@@ -713,7 +827,7 @@ async function handleDonationConfirmation(from, buttonId) {
 // Marks a match as donated and starts the donor's rest period.
 // With a facilityId the blood bank checked the donor's ID, so the donor also becomes "verified".
 async function recordDonation(matchId, donorId, facilityId) {
-  await pool.query(`UPDATE matches SET donation_confirmed = TRUE, confirmed_by_facility_id = $2 WHERE id = $1`, [matchId, facilityId]);
+  await pool.query(`UPDATE matches SET donation_confirmed = TRUE, donation_confirmed_at = NOW(), confirmed_by_facility_id = $2 WHERE id = $1`, [matchId, facilityId]);
   await pool.query(`UPDATE donors SET last_donation_date = CURRENT_DATE WHERE id = $1`, [donorId]);
   if (facilityId) {
     await pool.query(`UPDATE donors SET verified_at = NOW(), verified_by_facility_id = $2 WHERE id = $1`, [donorId, facilityId]);
@@ -1014,6 +1128,30 @@ async function sendDonorFlow(to) {
   );
 }
 
+// Generic approved-template sender: body text params, plus one payload per quick-reply button
+async function sendTemplate(to, name, bodyParams, buttonPayloads = []) {
+  await axios.post(
+    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'template',
+      template: {
+        name,
+        language: { code: 'en' },
+        components: [
+          { type: 'body', parameters: bodyParams.map(text => ({ type: 'text', text: String(text) })) },
+          ...buttonPayloads.map((payload, index) => ({
+            type: 'button', sub_type: 'quick_reply', index: String(index),
+            parameters: [{ type: 'payload', payload }]
+          }))
+        ]
+      }
+    },
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+}
+
 async function sendMessage(to, text) {
   await axios.post(
     `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
@@ -1038,6 +1176,19 @@ async function sendButtons(to, bodyText, buttons) {
     { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
+
+// Daily analytics: call once a day from an external cron (e.g. cron-job.org) with ?key=REPORT_KEY
+app.get('/reports/daily', async (req, res) => {
+  const key = req.get('x-report-key') || req.query.key;
+  if (!REPORT_KEY || key !== REPORT_KEY) return res.sendStatus(403);
+  try {
+    await sendDailySummary();
+    res.send('Daily summary sent.');
+  } catch (err) {
+    console.error('Daily summary error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
+    res.sendStatus(500);
+  }
+});
 
 app.get('/', (req, res) => res.send('LifeDrop bot is running.'));
 const PORT = process.env.PORT || 3000;
