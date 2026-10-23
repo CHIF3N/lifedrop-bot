@@ -153,7 +153,7 @@ test('everything under /admin/api is 403 until logged in with ADMIN_KEY', async 
     assert.strictEqual(stats.body.openRequests.length, 0);
     const page = await t.call('GET', '/'); // the page itself loads (it shows the login form)
     assert.strictEqual(page.status, 200);
-    assert.match(page.body, /LifeDrop Control/);
+    assert.match(page.body, /LifeDrop Admin/);
     const chartLib = await t.call('GET', '/vendor/chart.umd.js'); // charts are served from node_modules, no CDN
     assert.strictEqual(chartLib.status, 200);
     assert.match(chartLib.headers.get('content-type'), /javascript/);

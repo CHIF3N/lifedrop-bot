@@ -82,6 +82,33 @@ function toast(text, isError = false) {
   toast.timer = setTimeout(() => { t.hidden = true; }, 5000);
 }
 
+// In-page confirm box. Native confirm() is blocked in some browsers (it silently returns false), so never use it.
+// Only one question is open at a time: asking a new one answers the old one with "no".
+let answerConfirm = null;
+function finishConfirm(value) {
+  const answer = answerConfirm;
+  answerConfirm = null;
+  if ($('#confirm-dialog').open) $('#confirm-dialog').close();
+  if (answer) answer(value);
+}
+$('#confirm-ok').addEventListener('click', () => finishConfirm(true));
+$('#confirm-cancel').addEventListener('click', () => finishConfirm(false));
+// Esc key. The close event arrives late, so ignore it if a new question has already reopened the box.
+$('#confirm-dialog').addEventListener('close', () => { if (!$('#confirm-dialog').open) finishConfirm(false); });
+
+function askConfirm({ title, text, confirmLabel = 'Yes', tone = 'primary' }) {
+  finishConfirm(false);
+  $('#confirm-title').textContent = title;
+  $('#confirm-text').textContent = text;
+  $('#confirm-ok').textContent = confirmLabel;
+  $('#confirm-ok').className = `btn ${tone}`;
+  return new Promise(resolve => {
+    answerConfirm = resolve;
+    $('#confirm-dialog').showModal();
+    $('#confirm-cancel').focus(); // the safe choice has focus, so Enter never confirms by accident
+  });
+}
+
 // columns: [header, row => value or Node]
 function renderTable(table, rows, columns, emptyText = 'Nothing here yet.') {
   table.replaceChildren(
@@ -200,6 +227,7 @@ function setNavCount(id, value) {
 function chartDefaults() {
   Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
   Chart.defaults.font.size = 12;
+  Chart.defaults.font.weight = '600';
   Chart.defaults.color = css('--muted');
   Chart.defaults.borderColor = css('--border');
   Chart.defaults.plugins.legend.labels.usePointStyle = true;
@@ -209,7 +237,7 @@ function chartDefaults() {
   Chart.defaults.plugins.tooltip.titleColor = css('--bg');
   Chart.defaults.plugins.tooltip.bodyColor = css('--bg');
   Chart.defaults.plugins.tooltip.padding = 10;
-  Chart.defaults.plugins.tooltip.cornerRadius = 8;
+  Chart.defaults.plugins.tooltip.cornerRadius = 12;
   Chart.defaults.maintainAspectRatio = false;
 }
 
@@ -244,7 +272,7 @@ function kpiCard({ label, value, sub, tone, iconName, sparkKey, sparkData, spark
     card.append(el('div', { class: 'spark' }, canvas));
     requestAnimationFrame(() => drawChart(sparkKey, canvas, {
       type: 'line',
-      data: { labels: sparkData.map((_, i) => i), datasets: [{ data: sparkData, borderColor: sparkColor, borderWidth: 2, cubicInterpolationMode: 'monotone', pointRadius: 0, fill: true, backgroundColor: alpha(sparkColor, .12) }] },
+      data: { labels: sparkData.map((_, i) => i), datasets: [{ data: sparkData, borderColor: sparkColor, borderWidth: 3, cubicInterpolationMode: 'monotone', pointRadius: 0, fill: true, backgroundColor: alpha(sparkColor, .12) }] },
       options: { plugins: { legend: { display: false }, tooltip: { enabled: false } }, scales: { x: { display: false }, y: { display: false, beginAtZero: true } }, animation: false }
     }));
   }
@@ -259,6 +287,8 @@ function renderOverview({ stats: s, totals: t, series, bloodTypes, openRequests,
   const col = { c1: css('--c1'), c2: css('--c2'), c3: css('--c3'), c4: css('--c4'), c5: css('--c5'), c6: css('--c6'), ok: css('--ok'), danger: css('--danger') };
   const lastN = (key) => series.slice(-Math.max(days, 7)).map(r => n(r[key]));
 
+  const hour = Number(new Date().toLocaleString('en-GB', { timeZone: 'Africa/Douala', hour: '2-digit', hour12: false }));
+  $('#greeting').textContent = `${hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening'} 👋 Here is how LifeDrop is doing`;
   $('#updated').textContent = `Live data · updated ${new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} · ${periodLabel()}`;
   setNavCount('#nav-review', d.needs_review);
   setNavCount('#nav-open', t.requests_open);
@@ -293,7 +323,7 @@ function renderOverview({ stats: s, totals: t, series, bloodTypes, openRequests,
   const labels = series.map(r => new Date(`${r.day}T12:00:00`).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }));
   const line = (label, key, color, fill = false) => ({
     label, data: series.map(r => n(r[key])), borderColor: color, backgroundColor: fill ? alpha(color, .12) : color,
-    borderWidth: 2, cubicInterpolationMode: 'monotone', pointRadius: 0, pointHoverRadius: 4, fill
+    borderWidth: 3, cubicInterpolationMode: 'monotone', pointRadius: 0, pointHoverRadius: 5, fill
   });
   drawChart('activity', $('#chart-activity'), {
     type: 'line',
@@ -319,7 +349,7 @@ function renderOverview({ stats: s, totals: t, series, bloodTypes, openRequests,
       ctx.save();
       ctx.textAlign = 'center';
       ctx.fillStyle = css('--text');
-      ctx.font = `800 26px ${Chart.defaults.font.family}`;
+      ctx.font = `600 30px "Clash Display", ${Chart.defaults.font.family}`;
       ctx.fillText(fmt(d.total), x, y + 4);
       ctx.fillStyle = css('--muted');
       ctx.font = `600 11px ${Chart.defaults.font.family}`;
@@ -329,7 +359,7 @@ function renderOverview({ stats: s, totals: t, series, bloodTypes, openRequests,
   };
   drawChart('status', $('#chart-status'), {
     type: 'doughnut',
-    data: { labels: statusParts.map(p => p[0]), datasets: [{ data: statusParts.map(p => n(p[1])), backgroundColor: statusParts.map(p => p[2]), borderColor: css('--surface'), borderWidth: 3 }] },
+    data: { labels: statusParts.map(p => p[0]), datasets: [{ data: statusParts.map(p => n(p[1])), backgroundColor: statusParts.map(p => p[2]), borderColor: css('--surface'), borderWidth: 4, borderRadius: 6 }] },
     options: { cutout: '70%', plugins: { legend: { position: 'bottom' } } },
     plugins: [centerText]
   });
@@ -340,7 +370,7 @@ function renderOverview({ stats: s, totals: t, series, bloodTypes, openRequests,
   const all = Object.fromEntries((bloodTypes || []).map(x => [x.blood_type, n(x.count)]));
   const short = BLOOD_TYPES.filter(g => (demand[g] || 0) > (ready[g] || 0));
   $('#supply-note').textContent = short.length ? `⚠ short on ${short.join(', ')}` : `requests: ${periodLabel()}`;
-  const bars = (label, data, color) => ({ label, data, backgroundColor: color, borderRadius: 6, maxBarThickness: 26 });
+  const bars = (label, data, color) => ({ label, data, backgroundColor: color, borderRadius: 8, borderSkipped: false, maxBarThickness: 26 });
   drawChart('blood', $('#chart-blood'), {
     type: 'bar',
     data: {
@@ -361,8 +391,8 @@ function renderOverview({ stats: s, totals: t, series, bloodTypes, openRequests,
     data: {
       labels: cities.map(c => c.city.replace(/\b\w/g, ch => ch.toUpperCase())),
       datasets: [
-        { label: 'Ready', data: cities.map(c => n(c.ready)), backgroundColor: col.c3, borderRadius: 5, maxBarThickness: 22 },
-        { label: 'Not ready yet', data: cities.map(c => n(c.count) - n(c.ready)), backgroundColor: alpha(col.c6, .4), borderRadius: 5, maxBarThickness: 22 }
+        { label: 'Ready', data: cities.map(c => n(c.ready)), backgroundColor: col.c3, borderRadius: 8, borderSkipped: false, maxBarThickness: 24 },
+        { label: 'Not ready yet', data: cities.map(c => n(c.count) - n(c.ready)), backgroundColor: alpha(col.c6, .4), borderRadius: 8, borderSkipped: false, maxBarThickness: 24 }
       ]
     },
     options: { indexAxis: 'y', plugins: { legend: { position: 'top', align: 'end' } }, scales: { x: { stacked: true, beginAtZero: true, ticks: { precision: 0 } }, y: { stacked: true, grid: { display: false } } } }
@@ -414,8 +444,15 @@ const DONOR_STATUS = {
 const REPLY = { yes: ['Yes', 'ok'], no: ['No', 'danger'], no_reply: ['No reply', ''], not_needed: ['Not needed', 'info'] };
 const URGENCY = { Emergency: 'danger', Urgent: 'warn', Routine: 'info' };
 
-async function reviewDonor(id, decision) {
-  if (!confirm(decision === 'approve' ? 'Approve this donor? They can then be matched to requests.' : 'Reject this donor? They will not be matched.')) return;
+async function reviewDonor(id, decision, name) {
+  const approve = decision === 'approve';
+  const yes = await askConfirm({
+    title: approve ? `Approve ${name || 'this donor'}?` : `Reject ${name || 'this donor'}?`,
+    text: approve ? 'They become eligible and can be matched to blood requests.' : 'They will be marked not eligible and will not be matched.',
+    confirmLabel: approve ? 'Approve donor' : 'Reject donor',
+    tone: approve ? 'success' : 'danger'
+  });
+  if (!yes) return;
   try {
     await api(`/admin/api/donors/${id}/review`, { method: 'POST', body: { decision } });
     toast(decision === 'approve' ? 'Donor approved.' : 'Donor rejected.');
@@ -446,10 +483,10 @@ const COLUMNS = {
     ['Screening notes', r => (r.screening_reasons ? el('span', { class: 'cell-sub' }, r.screening_reasons) : '')],
     ['Last donation', r => fmtDay(r.last_donation_date)],
     ['Last message', r => ago(r.last_inbound_at)],
-    ['', r => (r.eligibility_status === 'needs_review'
+    ['Review', r => (r.eligibility_status === 'needs_review'
       ? el('span', { class: 'actions' },
-        el('button', { class: 'btn sm ok-outline', onclick: () => reviewDonor(r.id, 'approve') }, 'Approve'),
-        el('button', { class: 'btn sm danger-outline', onclick: () => reviewDonor(r.id, 'reject') }, 'Reject'))
+        el('button', { class: 'btn sm ok-outline', onclick: () => reviewDonor(r.id, 'approve', r.name) }, 'Approve'),
+        el('button', { class: 'btn sm danger-outline', onclick: () => reviewDonor(r.id, 'reject', r.name) }, 'Reject'))
       : (r.broadcast_opt_out ? badge('No news', '') : ''))]
   ],
   requests: [
@@ -625,13 +662,20 @@ $('#broadcast-cancel').addEventListener('click', hidePreview);
 
 $('#broadcast-send').addEventListener('click', async () => {
   if (!pendingBroadcast) return;
-  if (!confirm(`Last check: send this message to ${pendingBroadcast.expected_count} donor(s) now? This cannot be undone.`)) return;
+  const yes = await askConfirm({
+    title: `Send to ${pendingBroadcast.expected_count} donor(s)?`,
+    text: 'This goes out on WhatsApp right away and cannot be undone.',
+    confirmLabel: 'Send now',
+    tone: 'danger'
+  });
+  if (!yes) return;
   $('#broadcast-send').disabled = true;
   try {
     const { id, total } = await api('/admin/api/broadcasts', { method: 'POST', body: { ...pendingBroadcast, confirm: true } });
     toast(`Broadcast #${id} started: sending to ${total} donor(s).`);
     hidePreview();
     bForm.reset();
+    bForm.audience.dispatchEvent(new Event('change')); // hide the town / blood type boxes again
     $('#msg-count').textContent = '0';
     openBroadcastId = id;
     await loadBroadcasts();

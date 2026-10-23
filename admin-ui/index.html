@@ -4,8 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
-  <title>LifeDrop Control</title>
+  <title>LifeDrop Admin</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23e11d48' d='M12 2C9 6.5 5 10.6 5 15a7 7 0 0 0 14 0c0-4.4-4-8.5-7-13z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@500,600,700&f[]=satoshi@400,500,700,900&display=swap">
   <link rel="stylesheet" href="/admin/style.css">
   <script src="/admin/vendor/chart.umd.js" defer></script>
   <script src="/admin/app.js" defer></script>
@@ -28,7 +29,7 @@
 
   <section id="login" class="login" hidden>
     <form id="login-form" class="login-card">
-      <div class="brand big"><svg class="brand-mark"><use href="#i-drop"/></svg><span>LifeDrop <em>Control</em></span></div>
+      <div class="brand big"><svg class="brand-mark"><use href="#i-drop"/></svg><span>LifeDrop <em>admin</em></span></div>
       <p class="muted">Sign in with the admin key set on Render.</p>
       <label class="field">Admin key <input id="login-key" type="password" autocomplete="current-password" required></label>
       <button type="submit" class="btn primary block">Sign in</button>
@@ -38,7 +39,7 @@
 
   <div id="app" class="shell" hidden>
     <aside class="sidebar">
-      <div class="brand"><svg class="brand-mark"><use href="#i-drop"/></svg><span>LifeDrop <em>Control</em></span></div>
+      <div class="brand"><svg class="brand-mark"><use href="#i-drop"/></svg><span>LifeDrop <em>admin</em></span></div>
       <nav id="tabs" class="nav">
         <button data-tab="overview" class="active"><svg><use href="#i-grid"/></svg>Overview</button>
         <button data-tab="donors"><svg><use href="#i-users"/></svg>Donors<span class="nav-count" id="nav-review" hidden></span></button>
@@ -64,6 +65,7 @@
       <section data-panel="overview">
         <header class="page-head">
           <div>
+            <p class="eyebrow" id="greeting">Hello 👋</p>
             <h1>Overview</h1>
             <p class="muted" id="updated">Loading…</p>
           </div>
@@ -250,6 +252,15 @@
       </section>
     </main>
   </div>
+  <dialog id="confirm-dialog" class="dialog">
+    <div class="dialog-icon"><svg><use href="#i-drop"/></svg></div>
+    <h2 id="confirm-title">Are you sure?</h2>
+    <p id="confirm-text" class="muted"></p>
+    <div class="dialog-actions">
+      <button id="confirm-cancel" class="btn" type="button">Cancel</button>
+      <button id="confirm-ok" class="btn primary" type="button">Yes</button>
+    </div>
+  </dialog>
   <p id="toast" class="toast" hidden></p>
 </body>
 </html>

@@ -181,7 +181,7 @@ function createDashboard({
   router.use(express.json({ limit: '50kb' }));
   router.use((req, res, next) => {
     res.set({
-      'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'",
+      'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' https://api.fontshare.com; font-src https://cdn.fontshare.com; script-src 'self'; frame-ancestors 'none'",
       'X-Frame-Options': 'DENY',
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer',
