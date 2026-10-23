@@ -32,6 +32,10 @@ const donationWaitDays = (gender) => (gender === 'male' ? DONATION_WAIT_DAYS_MAL
 const COMMUNITY_LINK ='https://chat.whatsapp.com/EPIAr0zFQxVEYXru4PmRwF?s=cl&p=a&mlu=4&ilr=4';
 const SLOT_CAPACITY = parseInt(process.env.SLOT_CAPACITY, 10) || 3; // Max bookings per lab per time slot
 const SEED_DEMO_LABS = process.env.SEED_DEMO_LABS === 'true'; // Test numbers only: adds FICTIONAL labs
+// On: Routine/Urgent requests only go to donors whose blood group a partner lab confirmed (verified_at).
+// Emergencies still go to everyone (confirmed donors first). Off (default): everyone eligible gets requests.
+const REQUIRE_CONFIRMED_DONORS = process.env.REQUIRE_CONFIRMED_DONORS === 'true';
+const confirmedOnly = urgency => REQUIRE_CONFIRMED_DONORS && urgency !== 'Emergency';
 // Facilities (shared table) that donors can book a free test at
 const BOOKABLE_LAB = `is_partner AND does_lab_tests`;
 
@@ -106,6 +110,7 @@ async function initDb() {
         created_at TIMESTAMP DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS appointments_slot_idx ON appointments (facility_id, slot_at);
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS code TEXT;
       CREATE TABLE IF NOT EXISTS feature_interest (
         phone TEXT NOT NULL,
         feature TEXT NOT NULL,
@@ -455,7 +460,7 @@ async function handleMessage(from, text) {
 
   // Free test offer / lab list is open: anything typed except a pick moves on
   if (session.step === 'lab_offer' || session.step === 'lab_booking') {
-    if (text.toLowerCase() === 'skip') return finishLabStep(from, "No problem. Reply *test* any time to book a free blood test. 🧪");
+    if (text.toLowerCase() === 'skip') return finishLabStep(from, notNowText());
     return sendMessage(from, "Please pick an option from the message above, or reply 'skip'.");
   }
 
@@ -476,7 +481,7 @@ async function handleMessage(from, text) {
   switch (session.step) {
     case 'start': {
       session.step = 'menu';
-      const existing = await pool.query('SELECT name, last_donation_date, gender, deferred_until, eligibility_status FROM donors WHERE phone = $1', [from]);
+      const existing = await pool.query('SELECT name, last_donation_date, gender, deferred_until, eligibility_status, verified_at FROM donors WHERE phone = $1', [from]);
       if (existing.rows.length > 0) {
         const donor = existing.rows[0];
         const restDays = daysUntilEligible(donor.last_donation_date, donationWaitDays(donor.gender));
@@ -488,6 +493,9 @@ async function handleMessage(from, text) {
           restLine = restDays > 0
             ? `\n\nThank you for your last donation! ❤️ You're on a rest break. You can donate again in ${daysLeft} day(s). We won't send you requests until then.`
             : `\n\nYou can start donating in ${daysLeft} day(s). We won't send you requests until then.`;
+        }
+        if (REQUIRE_CONFIRMED_DONORS && !donor.verified_at && donor.eligibility_status === 'eligible') {
+          restLine += "\n\n🔒 Your blood group isn't confirmed yet, so we only contact you for emergencies. Reply *4* to book your free test.";
         }
         return sendMessage(from, `Welcome back, ${donor.name}! 🩸${restLine}\n\nReply:\n1 - Update my donor info\n2 - Request blood\n3 - Home lab test (coming soon)\n4 - Book a free blood test\n\n📍 Tip: send your location pin any time so we match you with patients nearby.`);
       }
@@ -790,10 +798,20 @@ async function continueOnboarding(from) {
     return;
   }
   session.step = 'lab_offer';
-  return sendButtons(from, "Would you like a free blood test (blood group + screening) at a partner lab near you? 🧪", [
+  const offerText = REQUIRE_CONFIRMED_DONORS
+    ? "🧪 *Last step: book your free blood test.* A partner lab confirms your blood group. After that, we can send you blood requests near you."
+    : "Would you like a free blood test (blood group + screening) at a partner lab near you? 🧪";
+  return sendButtons(from, offerText, [
     { id: 'labs_yes', title: 'Book free test' },
     { id: 'labs_no', title: 'Not now' }
   ]);
+}
+
+// Reply when a donor skips the free test; with the confirmed-donor rule on, say what they miss
+function notNowText() {
+  return REQUIRE_CONFIRMED_DONORS
+    ? "No problem. Until a partner lab confirms your blood group, we'll only contact you for emergencies. Reply *test* any time to book your free test. 🧪"
+    : "No problem. Reply *test* any time to book a free blood test. 🧪";
 }
 
 // Ends a lab step: new donors still get the feedback question, everyone else goes back to the menu
@@ -913,6 +931,10 @@ async function saveRequestAndMatch(phone, d) {
   const matchedDonors = { rows: await findMatchingDonors(d, notifyCount) };
   const farthestKm = Math.max(0, ...matchedDonors.rows.map(r => r.dist_km ?? 0));
   const radiusLine = matchedDonors.rows.some(r => r.dist_km != null) ? `\n📏 *Search radius:* ${geo.ringFor(farthestKm)} km` : '';
+  const unconfirmedCount = matchedDonors.rows.filter(r => r.verified_at == null).length;
+  const confirmedLine = !REQUIRE_CONFIRMED_DONORS ? ''
+    : confirmedOnly(d.urgency) ? '\n🔒 *Confirmed donors only*'
+    : `\n🔓 *Emergency:* ${unconfirmedCount} unconfirmed donor(s) included`;
   const detailLines = `\n👤 *Patient:* ${d.patient_name || 'Not given'}\n📝 *Reason:* ${reasonTitle(d.reason) || 'Not given'}\n📞 *Contact:* ${d.contact_name ? d.contact_name + ' (' + d.contact_phone + ')' : 'Requester'}\n🏷️ *Partner hospital:* ${d.facility_id ? 'Yes (ID ' + d.facility_id + ')' : 'No'}`;
 
   if (matchedDonors.rows.length === 0) {
@@ -923,11 +945,11 @@ async function saveRequestAndMatch(phone, d) {
       [d.blood_type_needed, `%${d.location}%`]
     );
     await notifyCustomerService(
-      `⚠️ *NO DONOR MATCH FOUND!*\n\n🆔 *Request:* #${requestId}\n👥 *Same blood group in this area:* ${areaPool.rows[0].total} registered, ${areaPool.rows[0].eligible} screened eligible (all resting or waiting)\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'Not specified'}\n⚡ *Urgency:* ${d.urgency}${detailLines}\n📱 *Requester Phone:* ${phone}\n\n*Action Required:* Manual donor outreach needed.`
+      `⚠️ *NO DONOR MATCH FOUND!*\n\n🆔 *Request:* #${requestId}\n👥 *Same blood group in this area:* ${areaPool.rows[0].total} registered, ${areaPool.rows[0].eligible} screened eligible (all resting or waiting)\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'Not specified'}\n⚡ *Urgency:* ${d.urgency}${confirmedLine}${detailLines}\n📱 *Requester Phone:* ${phone}\n\n*Action Required:* Manual donor outreach needed.`
     );
   } else {
     await notifyCustomerService(
-      `🩸 *New Blood Request Logged*\n\n🆔 *Request:* #${requestId}\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'N/A'}\n⚡ *Urgency:* ${d.urgency}\n👥 *Donors Contacted:* ${matchedDonors.rows.length}${radiusLine}${detailLines}\n📱 *Requester Phone:* ${phone}`
+      `🩸 *New Blood Request Logged*\n\n🆔 *Request:* #${requestId}\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'N/A'}\n⚡ *Urgency:* ${d.urgency}\n👥 *Donors Contacted:* ${matchedDonors.rows.length}${radiusLine}${confirmedLine}${detailLines}\n📱 *Requester Phone:* ${phone}`
     );
 
     for (const donor of matchedDonors.rows) {
@@ -936,7 +958,7 @@ async function saveRequestAndMatch(phone, d) {
           `INSERT INTO matches (request_id, donor_id, contacted_at) VALUES ($1, $2, NOW()) RETURNING id`,
           [requestId, donor.id]
         );
-        await notifyDonor(donor.name, donor.phone, donor.last_inbound_at, matchResult.rows[0].id, d, donor.dist_km);
+        await notifyDonor(donor.name, donor.phone, donor.last_inbound_at, matchResult.rows[0].id, d, donor.dist_km, donor.verified_at != null);
       } catch (err) {
         console.error(`Failed to notify donor ${donor.id}:`, err.message);
       }
@@ -970,15 +992,18 @@ async function findMatchingDonors(d, limit) {
     AND (deferred_until IS NULL OR deferred_until <= CURRENT_DATE)
     AND (last_donation_date IS NULL OR last_donation_date <= CURRENT_DATE - (CASE WHEN gender = 'male' THEN $2 ELSE $3 END)::int)`;
   const baseParams = [d.blood_type_needed, DONATION_WAIT_DAYS_MALE, DONATION_WAIT_DAYS_FEMALE];
+  const confirmedFilter = confirmedOnly(d.urgency) ? 'AND verified_at IS NOT NULL' : '';
+  // Emergencies with the rule on: everyone is asked, but confirmed donors come first
+  const confirmedFirst = REQUIRE_CONFIRMED_DONORS ? '(verified_at IS NOT NULL) DESC, ' : '';
   const point = d.lat != null ? { lat: d.lat, lng: d.lng } : geo.townByName(d.town) || geo.findTown(d.location);
   let donors = [];
 
   if (point) {
     const nearby = await pool.query(
-      `SELECT id, name, phone, last_inbound_at, dist_km FROM (
-         SELECT id, name, phone, last_inbound_at, ${geo.distanceSql('$4', '$5')} AS dist_km
-         FROM donors WHERE ${baseFilter} AND lat IS NOT NULL AND lng IS NOT NULL
-       ) d WHERE dist_km <= $6 ORDER BY dist_km LIMIT $7`,
+      `SELECT id, name, phone, last_inbound_at, verified_at, dist_km FROM (
+         SELECT id, name, phone, last_inbound_at, verified_at, ${geo.distanceSql('$4', '$5')} AS dist_km
+         FROM donors WHERE ${baseFilter} ${confirmedFilter} AND lat IS NOT NULL AND lng IS NOT NULL
+       ) d WHERE dist_km <= $6 ORDER BY ${confirmedFirst}dist_km LIMIT $7`,
       [...baseParams, point.lat, point.lng, geo.MAX_RADIUS_KM, limit]
     );
     donors = nearby.rows;
@@ -989,10 +1014,10 @@ async function findMatchingDonors(d, limit) {
     const patterns = [...new Set([d.location, ...towns])].filter(Boolean).map(t => `%${t}%`);
     const cityFilter = point ? '(town = ANY($4) OR (town IS NULL AND city ILIKE ANY($5)))' : '(town = ANY($4) OR city ILIKE ANY($5))';
     const byCity = await pool.query(
-      `SELECT id, name, phone, last_inbound_at, NULL::float AS dist_km FROM donors
-       WHERE ${baseFilter} AND ${cityFilter} AND NOT (id = ANY($6))
+      `SELECT id, name, phone, last_inbound_at, verified_at, NULL::float AS dist_km FROM donors
+       WHERE ${baseFilter} ${confirmedFilter} AND ${cityFilter} AND NOT (id = ANY($6))
          ${point ? 'AND lat IS NULL' : ''}
-       ORDER BY (town IS NOT DISTINCT FROM $7) DESC, (city ILIKE $8) DESC
+       ORDER BY ${confirmedFirst}(town IS NOT DISTINCT FROM $7) DESC, (city ILIKE $8) DESC
        LIMIT $9`,
       [...baseParams, towns, patterns, donors.map(x => x.id), d.town || null, `%${d.location}%`, limit - donors.length]
     );
@@ -1041,13 +1066,16 @@ async function handleRequesterFollowUp(from, buttonId) {
 }
 
 // Notify donor via 24h interactive buttons or template
-async function notifyDonor(donorName, donorPhone, lastInboundAt, matchId, requestData, distanceKm) {
+async function notifyDonor(donorName, donorPhone, lastInboundAt, matchId, requestData, distanceKm, confirmed = true) {
   const withinWindow = lastInboundAt && (Date.now() - new Date(lastInboundAt).getTime()) < 24 * 60 * 60 * 1000;
   if (withinWindow) {
     const hospitalLine = requestData.hospital_name ? ` at ${requestData.hospital_name}` : '';
     const unitsLine = requestData.units_needed ? ` (${requestData.units_needed} unit(s) needed total)` : '';
     const distanceLine = distanceKm != null ? `\n📍 About ${Math.max(1, Math.round(distanceKm))} km from you` : '';
-    const body = `Hello ${donorName}! 🩸 Blood needed: ${requestData.blood_type_needed} in ${requestData.location}${hospitalLine}.\nUrgency: ${requestData.urgency}${unitsLine}${distanceLine}\n\nReminder: LifeDrop doesn't pay donors — any support is arranged directly with the requester.\n\nCan you donate?`;
+    const unconfirmedLine = REQUIRE_CONFIRMED_DONORS && !confirmed
+      ? "\n\n⚠️ Your blood group is not confirmed yet, so the hospital will test your blood first. Reply *test* afterwards to book your free test."
+      : '';
+    const body = `Hello ${donorName}! 🩸 Blood needed: ${requestData.blood_type_needed} in ${requestData.location}${hospitalLine}.\nUrgency: ${requestData.urgency}${unitsLine}${distanceLine}${unconfirmedLine}\n\nReminder: LifeDrop doesn't pay donors — any support is arranged directly with the requester.\n\nCan you donate?`;
     await sendButtons(donorPhone, body, [
       { id: `match_yes_${matchId}`, title: 'Yes, I can' },
       { id: `match_no_${matchId}`, title: 'Not available' }
@@ -1648,7 +1676,7 @@ async function handleLabOffer(from, buttonId) {
     if (!shown) return finishLabStep(from);
     return;
   }
-  return finishLabStep(from, "No problem. Reply *test* any time to book a free blood test. 🧪");
+  return finishLabStep(from, notNowText());
 }
 
 // Shows the closest partner labs as a WhatsApp list. Returns false if there was nothing to pick.
@@ -1748,20 +1776,31 @@ async function bookSlot(from, slot) {
 
   // Booked less than a day ahead: this confirmation is the reminder
   const remindLater = slot.slotAt.getTime() - Date.now() > 24 * 60 * 60 * 1000;
+  const testCode = await generateTestCode();
   const inserted = await pool.query(
-    `INSERT INTO appointments (donor_phone, facility_id, slot_at, reminder_sent) VALUES ($1, $2, $3, $4) RETURNING id`,
-    [from, lab.id, slot.slotAt, !remindLater]
+    `INSERT INTO appointments (donor_phone, facility_id, slot_at, reminder_sent, code) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+    [from, lab.id, slot.slotAt, !remindLater, testCode]
   );
   const apptId = inserted.rows[0].id;
 
   const demoLine = lab.is_demo ? '\n\n⚠️ This is a DEMO lab for testing. It is not a real clinic.' : '';
   await sendButtons(
     from,
-    `✅ Booked! Free blood test\n🏥 ${lab.name}, ${lab.town || ''}\n🕘 ${formatSlot(slot.slotAt)}${lab.hours ? `\n⏰ Open ${lab.hours}` : ''}\n\nPlease bring an ID card.${remindLater ? " We'll remind you the day before." : ''}${demoLine}`,
+    `✅ Booked! Free blood test\n🏥 ${lab.name}, ${lab.town || ''}\n🕘 ${formatSlot(slot.slotAt)}${lab.hours ? `\n⏰ Open ${lab.hours}` : ''}\n🔑 Your code: *${testCode}*\n\nPlease bring an ID card and show this code at the lab. They will confirm your blood group.${remindLater ? " We'll remind you the day before." : ''}${demoLine}`,
     [{ id: `appt_cancel_${apptId}`, title: 'Cancel booking' }]
   );
-  await notifyCustomerService(`🧪 *Free Test Booked*\n\n📞 *Donor:* ${from}\n🏥 *Lab:* ${lab.name}${lab.is_demo ? ' (DEMO)' : ''}\n🕘 *Time:* ${formatSlot(slot.slotAt)}\n🆔 *Appointment ID:* ${apptId}`);
+  await notifyCustomerService(`🧪 *Free Test Booked*\n\n📞 *Donor:* ${from}\n🏥 *Lab:* ${lab.name}${lab.is_demo ? ' (DEMO)' : ''}\n🕘 *Time:* ${formatSlot(slot.slotAt)}\n🔑 *Code:* ${testCode}\n🆔 *Appointment ID:* ${apptId}`);
   return finishLabStep(from);
+}
+
+// Code the donor shows at the lab, e.g. LT-48213; lab staff send it to confirm the blood group (unique among open bookings)
+async function generateTestCode() {
+  for (let i = 0; i < 5; i++) {
+    const code = `LT-${crypto.randomInt(10000, 100000)}`;
+    const clash = await pool.query(`SELECT 1 FROM appointments WHERE code = $1 AND status = 'booked'`, [code]);
+    if (clash.rows.length === 0) return code;
+  }
+  return `LT-${Date.now().toString().slice(-7)}`;
 }
 
 // Reminder / confirmation buttons: appt_yes_<id>, appt_cancel_<id>
