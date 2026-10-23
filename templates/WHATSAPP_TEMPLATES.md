@@ -21,8 +21,9 @@ Status column: **Used by bot** = code already sends it. **Text only** = submit n
 | 5 | `blood_sos` | Utility | Text only |
 | 6 | `donor_broadcast` | Marketing | Text only |
 | 7 | `supporter_contribution` | Marketing | Text only |
-| 8 | `hospital_admin_notice` | Utility | Text only |
-| 9 | `hospital_donor_incoming` | Utility | Text only |
+| 8 | `hospital_admin_notice` | Utility | Used by bot (welcome when you run `addhospital`) |
+| 9 | `hospital_donor_incoming` | Utility | Used by bot |
+| 10 | `hospital_request_alert` | Utility | Used by bot |
 
 ---
 
@@ -138,4 +139,17 @@ Hello {{1}}, a LifeDrop donor, {{2}} (blood group {{3}}), has agreed to donate f
 **Button** (Quick reply): `Noted`
 **Samples:** {{1}} `Buea Regional Hospital` · {{2}} `Jean M.` · {{3}} `O+` · {{4}} `LD-48213`
 
-Needs the request to be linked to a partner facility first (hospital picker), which is not built yet.
+Sent when a donor accepts a request where the family picked this partner hospital.
+
+---
+
+## 10. `hospital_request_alert` (Utility): system to hospital, new request for their patient
+
+**Body**
+```
+Hello {{1}}, LifeDrop received blood request {{2}} for a patient at your facility: {{3}} unit(s), urgency {{4}}. Patient: {{5}}. Family contact: {{6}}. Reply "requests" to see the details.
+```
+**Button** (Quick reply): `Noted`
+**Samples:** {{1}} `Buea Regional Hospital` · {{2}} `#42` · {{3}} `O+ x 2` · {{4}} `Emergency` · {{5}} `M. N.` · {{6}} `Paul (237677123456)`
+
+Sent when the family picks this partner hospital in the request flow.

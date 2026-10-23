@@ -8,7 +8,9 @@ const geo = require('./geo');
 const { upcomingSlots, formatSlot, slotId, parseSlotId } = require('./slots');
 const { evaluateScreening } = require('./screening');
 const { parseResultsRequest, normalizeBloodGroup, parseResultButton, neutralResultMessage } = require('./results');
-const { formatTime, splitReport, formatStatsReport, dailySummaryParams } = require('./reports');
+const { formatTime, toTemplateParam, splitReport, formatStatsReport, dailySummaryParams } = require('./reports');
+const { normalizePhone, parseAdminCommand, HELP_TEXT } = require('./admin');
+const { BLOOD_GROUP_ROWS, REQUEST_REASONS, reasonTitle, requestSummary, parseContact } = require('./request-form');
 
 const app = express();
 app.use(bodyParser.json());
@@ -19,6 +21,8 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const CS_PHONE_NUMBER = process.env.CS_PHONE_NUMBER;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Phones allowed to run admin commands (stats, addhospital...): the CS phone plus ADMIN_PHONES (comma-separated)
+const ADMIN_PHONES = [CS_PHONE_NUMBER, ...(process.env.ADMIN_PHONES || '').split(',')].map(normalizePhone).filter(Boolean);
 const REPORT_KEY = process.env.REPORT_KEY; // Secret for the /reports/daily endpoint (called by an external cron)
 const DONOR_FLOW_ID =process.env.DONOR_FLOW_ID || '1747598403124876';
 // Rest period between confirmed whole-blood donations (WHO minimum: 12 weeks men, 16 weeks women)
@@ -62,6 +66,12 @@ async function initDb() {
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS responded_at TIMESTAMP;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS donation_confirmed_at TIMESTAMP;
       ALTER TABLE requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS fulfilled_at TIMESTAMP;
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS facility_id INTEGER;
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS patient_name TEXT;
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS reason TEXT;
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS contact_name TEXT;
+      ALTER TABLE requests ADD COLUMN IF NOT EXISTS contact_phone TEXT;
       ALTER TABLE donors ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_blood_group TEXT;
       ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_outcome TEXT;
@@ -161,13 +171,15 @@ app.post('/webhook', async (req, res) => {
       } else {
         const text = message.text?.body?.trim() || '';
         const resultsCode = parseResultsRequest(text);
-        const statsMatch = isSupportPhone(from) ? /^(?:stats|report)(?:\s+(\d{1,3}))?$/i.exec(text) : null;
-        if (statsMatch) {
-          await sendStatsReport(from, Math.min(parseInt(statsMatch[1], 10) || 7, 365));
+        const adminCommand = isAdmin(from) ? parseAdminCommand(text) : null;
+        if (adminCommand) {
+          await handleAdminCommand(from, adminCommand);
         } else if (resultsCode) {
           await handleResultsRequest(from, resultsCode);
         } else if (/^LD-?\s?\d{5}$/i.test(text)) {
           await handleFacilityCode(from, text);
+        } else if (sessions[from]?.step !== 'results_blood_group' && await handleFacilityMessage(from, text)) {
+          // Partner hospital staff: handled by the hospital menu
         } else {
           await handleMessage(from, text);
         }
@@ -233,39 +245,58 @@ async function notifyCustomerService(text) {
   }
 }
 
-const isSupportPhone = (phone) => Boolean(CS_PHONE_NUMBER) && phone === CS_PHONE_NUMBER.replace(/\D/g, '');
+const isAdmin = (phone) => ADMIN_PHONES.includes(phone);
 
 // Analytics numbers for the last N days (donor counts are current totals)
+const READY_SQL = `eligibility_status = 'eligible'
+  AND (deferred_until IS NULL OR deferred_until <= CURRENT_DATE)
+  AND (last_donation_date IS NULL OR last_donation_date <= CURRENT_DATE - (CASE WHEN gender = 'male' THEN ${DONATION_WAIT_DAYS_MALE} ELSE ${DONATION_WAIT_DAYS_FEMALE} END))`;
+
 async function getStats(days) {
   const since = [days];
-  const [donors, bloodTypes, requests, topLocations, matches, donations, facilities, waitlist] = await Promise.all([
+  const recent = `created_at >= NOW() - $1 * INTERVAL '1 day'`;
+  const [donors, donorsByCity, readyByType, requests, demandByType, topLocations, matches, donations, facilities, waitlist, activity] = await Promise.all([
     pool.query(
       `SELECT COUNT(*) AS total,
-         COUNT(*) FILTER (WHERE created_at >= NOW() - $1 * INTERVAL '1 day') AS new,
-         COUNT(*) FILTER (WHERE eligibility_status = 'eligible'
-           AND (deferred_until IS NULL OR deferred_until <= CURRENT_DATE)
-           AND (last_donation_date IS NULL OR last_donation_date <= CURRENT_DATE - (CASE WHEN gender = 'male' THEN $2 ELSE $3 END)::int)) AS ready,
-         COUNT(*) FILTER (WHERE last_donation_date > CURRENT_DATE - (CASE WHEN gender = 'male' THEN $2 ELSE $3 END)::int) AS resting,
+         COUNT(*) FILTER (WHERE ${recent}) AS new,
+         COUNT(*) FILTER (WHERE ${READY_SQL}) AS ready,
+         COUNT(*) FILTER (WHERE last_donation_date > CURRENT_DATE - (CASE WHEN gender = 'male' THEN ${DONATION_WAIT_DAYS_MALE} ELSE ${DONATION_WAIT_DAYS_FEMALE} END)) AS resting,
          COUNT(*) FILTER (WHERE eligibility_status = 'eligible' AND deferred_until > CURRENT_DATE) AS waiting,
          COUNT(*) FILTER (WHERE eligibility_status = 'needs_review') AS needs_review,
          COUNT(*) FILTER (WHERE eligibility_status IN ('needs_update', 'on_hold')) AS paused,
          COUNT(*) FILTER (WHERE eligibility_status = 'not_eligible') AS not_eligible,
-         COUNT(*) FILTER (WHERE verified_at IS NOT NULL) AS verified
+         COUNT(*) FILTER (WHERE verified_at IS NOT NULL) AS verified,
+         COUNT(*) FILTER (WHERE blood_type IS NULL OR blood_type = 'UNKNOWN') AS unknown_type,
+         COUNT(*) FILTER (WHERE lat IS NOT NULL) AS with_pin
        FROM donors`,
-      [days, DONATION_WAIT_DAYS_MALE, DONATION_WAIT_DAYS_FEMALE]
+      since
     ),
-    pool.query(`SELECT blood_type, COUNT(*) AS count FROM donors GROUP BY blood_type ORDER BY COUNT(*) DESC`),
+    pool.query(
+      `SELECT lower(trim(city)) AS city, COUNT(*) AS count, COUNT(*) FILTER (WHERE ${READY_SQL}) AS ready
+       FROM donors GROUP BY 1 ORDER BY 2 DESC LIMIT 8`
+    ),
+    pool.query(`SELECT blood_type, COUNT(*) AS count FROM donors WHERE ${READY_SQL} GROUP BY 1`),
     pool.query(
       `SELECT COUNT(*) AS total,
+         COALESCE(SUM(units_needed), 0) AS units,
          COUNT(*) FILTER (WHERE urgency = 'Emergency') AS emergency,
+         COUNT(*) FILTER (WHERE urgency = 'Urgent') AS urgent,
+         COUNT(*) FILTER (WHERE urgency = 'Routine') AS routine,
          COUNT(*) FILTER (WHERE status = 'fulfilled') AS fulfilled,
-         COUNT(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM matches m WHERE m.request_id = r.id)) AS no_match
-       FROM requests r WHERE created_at >= NOW() - $1 * INTERVAL '1 day'`,
+         COUNT(*) FILTER (WHERE facility_id IS NOT NULL) AS partner,
+         COUNT(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM matches m WHERE m.request_id = r.id)) AS no_match,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM fulfilled_at - created_at) / 60)
+           FILTER (WHERE fulfilled_at IS NOT NULL) AS median_minutes_to_fulfil
+       FROM requests r WHERE ${recent}`,
+      since
+    ),
+    pool.query(
+      `SELECT blood_type_needed, COALESCE(SUM(units_needed), 0) AS units FROM requests WHERE ${recent} GROUP BY 1`,
       since
     ),
     pool.query(
       `SELECT lower(trim(location)) AS location, COUNT(*) AS count FROM requests
-       WHERE created_at >= NOW() - $1 * INTERVAL '1 day' GROUP BY 1 ORDER BY 2 DESC LIMIT 5`,
+       WHERE ${recent} GROUP BY 1 ORDER BY 2 DESC LIMIT 5`,
       since
     ),
     pool.query(
@@ -287,32 +318,37 @@ async function getStats(days) {
        FROM matches`,
       since
     ),
-    pool.query(`SELECT COUNT(*) FILTER (WHERE is_partner) AS partners FROM facilities`),
-    pool.query(`SELECT COUNT(*) AS home_lab FROM feature_interest WHERE feature = 'home_lab_test'`)
+    pool.query(`SELECT COUNT(*) FILTER (WHERE is_partner AND is_demo IS NOT TRUE) AS partners FROM facilities`),
+    pool.query(`SELECT COUNT(*) AS home_lab FROM feature_interest WHERE feature = 'home_lab_test'`),
+    pool.query(`SELECT COUNT(*) AS tests_booked FROM appointments WHERE ${recent}`, since)
   ]);
   return {
-    donors: donors.rows[0], bloodTypes: bloodTypes.rows, requests: requests.rows[0], topLocations: topLocations.rows,
-    matches: matches.rows[0], donations: donations.rows[0], facilities: facilities.rows[0], waitlist: waitlist.rows[0]
+    donors: donors.rows[0], donorsByCity: donorsByCity.rows, readyByType: readyByType.rows,
+    requests: requests.rows[0], demandByType: demandByType.rows, topLocations: topLocations.rows,
+    matches: matches.rows[0], donations: donations.rows[0], facilities: facilities.rows[0],
+    waitlist: waitlist.rows[0], activity: activity.rows[0]
   };
 }
 
-// Support phone texts "stats" or "stats 30": the reply is inside its 24h window, so a plain message works
+// Admin phone texts "stats" or "stats 30": the reply is inside its 24h window, so plain messages work
 async function sendStatsReport(to, days) {
   const stats = await getStats(days);
-  return sendMessage(to, formatStatsReport(stats, days));
+  for (const part of formatStatsReport(stats, days)) {
+    await sendMessage(to, part);
+  }
 }
 
 // Daily summary for the support line: full text if its window is open, else the lifedrop_daily_summary template
 async function sendDailySummary() {
   const stats = await getStats(1);
-  const text = formatStatsReport(stats, 1);
+  const parts = formatStatsReport(stats, 1);
   if (!CS_PHONE_NUMBER) {
-    console.log('[Daily summary (No CS Phone Configured)]:\n', text);
+    console.log('[Daily summary (No CS Phone Configured)]:\n', parts.join('\n\n'));
     return;
   }
   const cleanNumber = CS_PHONE_NUMBER.replace(/\D/g, '');
   try {
-    await sendMessage(cleanNumber, text);
+    for (const part of parts) await sendMessage(cleanNumber, part);
   } catch (err) {
     await sendTemplate(cleanNumber, 'lifedrop_daily_summary', dailySummaryParams(stats));
   }
@@ -429,8 +465,7 @@ async function handleMessage(from, text) {
         sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
         return sendDonorFlow(from);
       } else if (text === '2') {
-        session.step = 'request_blood_type';
-        return sendMessage(from, "What blood type is needed? (e.g. A+, O-, B+, AB+)");
+        return askBloodGroup(from, session);
       } else if (text === '3') {
         return sendButtons(
           from,
@@ -451,45 +486,93 @@ async function handleMessage(from, text) {
         return sendMessage(from, "Please reply with *1* to register as a donor or *2* to request blood.");
       }
 
-    case 'request_blood_type':
-      session.data.blood_type_needed = text.toUpperCase();
+    case 'request_blood_type': {
+      const group = normalizeBloodGroup(text.replace(/^bg_/, ''));
+      if (!group) return askBloodGroup(from, session, "Please choose a blood group from the list, or type it (e.g. O+, AB-).\n\n");
+      session.data.blood_type_needed = group;
       session.step = 'request_location';
-      return sendLocationRequest(from, "Where is the patient? 📍 Tap *Send location* (the hospital's pin is best), or type the city/town.");
+      return sendLocationRequest(from, "📍 *Step 2 of 7: Location*\nWhere is the patient? Tap *Send location* (the hospital's pin is best), or type the city/town.");
+    }
 
     case 'request_location':
       // A pin is handled in handleLocation; typed text is a town name
       session.data.location = text;
-      session.step = 'request_hospital';
-      return sendMessage(from, "Which hospital or clinic? (enter hospital name, or reply 'skip')");
+      return askHospital(from, session, '');
 
-    case 'request_hospital':
+    case 'request_hospital': {
+      if (text === 'hosp_other') {
+        session.step = 'request_hospital_name';
+        return sendMessage(from, "Please type the name of the hospital or clinic.");
+      }
+      if (text.startsWith('hosp_') && text !== 'hosp_skip') {
+        const picked = await pool.query(`SELECT id, name FROM facilities WHERE id = $1 AND is_partner = TRUE`, [parseInt(text.replace('hosp_', ''), 10)]);
+        session.data.facility_id = picked.rows[0]?.id || null;
+        session.data.hospital_name = picked.rows[0]?.name || null;
+      } else {
+        session.data.hospital_name = text === 'hosp_skip' || text.toLowerCase() === 'skip' ? null : text;
+      }
+      return askPatientName(from, session);
+    }
+
+    case 'request_hospital_name':
       session.data.hospital_name = text.toLowerCase() === 'skip' ? null : text;
+      return askPatientName(from, session);
+
+    case 'request_patient':
+      session.data.patient_name = text.toLowerCase() === 'skip' ? null : text.slice(0, 80);
+      session.step = 'request_reason';
+      return sendList(from, 'Reason', "📝 *Step 5 of 7: Reason*\nWhat is the blood needed for? This helps the hospital and our team prepare.", 'Choose reason', [
+        { title: 'Reason', rows: REQUEST_REASONS }
+      ]);
+
+    case 'request_reason':
+      session.data.reason = REQUEST_REASONS.some(r => r.id === text) ? text : 'reason_other';
       session.step = 'request_units';
-      return sendMessage(from, "How many units/pints are needed? (reply with a number, or 'skip' for 1)");
+      return sendButtons(from, "🧪 *Step 6 of 7: Units and urgency*\nHow many units (bags) of blood are needed?", [
+        { id: 'units_1', title: '1 unit' },
+        { id: 'units_2', title: '2 units' },
+        { id: 'units_more', title: '3 or more' }
+      ]);
 
     case 'request_units': {
-      const parsed = parseInt(text, 10);
-      session.data.units_needed = isNaN(parsed) || parsed < 1 ? 1 : parsed;
+      if (text === 'units_more') {
+        return sendMessage(from, "How many units are needed? Reply with a number, e.g. 4.");
+      }
+      const parsed = parseInt(text.replace('units_', ''), 10);
+      session.data.units_needed = isNaN(parsed) || parsed < 1 ? 1 : Math.min(parsed, 20);
       session.step = 'request_urgency';
-      return sendButtons(from, "How urgent is this?", [
-        { id: 'urgency_routine', title: 'Routine' },
+      return sendButtons(from, "How urgent is this?\n• *Emergency*: needed within hours\n• *Urgent*: within 1–2 days\n• *Routine*: planned, a few days ahead", [
+        { id: 'urgency_emergency', title: 'Emergency' },
         { id: 'urgency_urgent', title: 'Urgent' },
-        { id: 'urgency_emergency', title: 'Emergency' }
+        { id: 'urgency_routine', title: 'Routine' }
       ]);
     }
 
     case 'request_urgency': {
       const urgencyMap = { urgency_routine: 'Routine', urgency_urgent: 'Urgent', urgency_emergency: 'Emergency' };
-      session.data.urgency = urgencyMap[text] || text;
-      session.step = 'request_consent';
-      return sendButtons(
-        from,
-        "Before we proceed: do you agree to arrange any transport, feeding, or other support directly with the donor? LifeDrop does not pay donors and does not manage compensation.",
-        [
-          { id: 'consent_agree', title: 'I agree' },
-          { id: 'consent_decline', title: 'Cancel' }
-        ]
-      );
+      session.data.urgency = urgencyMap[text] || 'Urgent';
+      session.step = 'request_contact_choice';
+      return sendButtons(from, "📞 *Step 7 of 7: Contact*\nWho should the donor call to coordinate?", [
+        { id: 'contact_me', title: 'Me (this number)' },
+        { id: 'contact_other', title: 'Someone else' }
+      ]);
+    }
+
+    case 'request_contact_choice':
+      if (text === 'contact_other') {
+        session.step = 'request_contact';
+        return sendMessage(from, "Send the contact person's name and phone number, e.g.:\nPaul 677123456");
+      }
+      session.data.contact_name = null;
+      session.data.contact_phone = null;
+      return showRequestSummary(from, session);
+
+    case 'request_contact': {
+      const contact = parseContact(text);
+      if (!contact) return sendMessage(from, "Please include a phone number, e.g.:\nPaul 677123456");
+      session.data.contact_name = contact.name;
+      session.data.contact_phone = contact.phone;
+      return showRequestSummary(from, session);
     }
 
     case 'request_consent': {
@@ -498,26 +581,24 @@ async function handleMessage(from, text) {
         return sendMessage(from, "Request cancelled. Message us anytime you need assistance.");
       }
 
+      if (text === 'request_edit') {
+        sessions[from] = { step: 'menu', data: {}, aiAttempts: 0 };
+        return askBloodGroup(from, sessions[from], "No problem, let's start the request again.\n\n");
+      }
+
       if (text !== 'consent_agree') {
-        return sendButtons(
-          from,
-          "Please select an option below to proceed:",
-          [
-            { id: 'consent_agree', title: 'I agree' },
-            { id: 'consent_decline', title: 'Cancel' }
-          ]
-        );
+        return showRequestSummary(from, session);
       }
 
       const requestPayload = { ...session.data };
       sessions[from] = { step: 'start', data: {}, aiAttempts: 0 }; // Clear session state immediately
 
       try {
-        const matchCount = await saveRequestAndMatch(from, requestPayload);
+        const { matchCount, requestId } = await saveRequestAndMatch(from, requestPayload);
         if (matchCount === 0) {
-          return sendMessage(from, `Request logged. We currently do not have eligible donors matching ${requestPayload.blood_type_needed} in ${requestPayload.location}. Our support team has been notified to assist manually.`);
+          return sendMessage(from, `✅ Request *#${requestId}* logged.\n\nWe don't have an available ${requestPayload.blood_type_needed} donor near ${requestPayload.location} right now. Our support team has been alerted and will help you directly.`);
         }
-        return sendMessage(from, `Request logged. Reaching out to ${matchCount} eligible donor(s) in ${requestPayload.location} now. We will notify you the moment someone confirms.`);
+        return sendMessage(from, `✅ Request *#${requestId}* logged.\n\nWe are contacting ${matchCount} available ${requestPayload.blood_type_needed} donor(s) near ${requestPayload.location} now. You will get the donor's name and number the moment someone accepts.`);
       } catch (err) {
         console.error('Failed processing blood request:', err);
         return sendMessage(from, "Your request was logged, but we experienced an issue reaching out to donors automatically. Our customer support team has been notified.");
@@ -528,6 +609,49 @@ async function handleMessage(from, text) {
       sessions[from] = { step: 'start', data: {}, aiAttempts: 0 };
       return sendMessage(from, "Let's start over. Welcome to LifeDrop 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood\n3 - Home lab test (coming soon)");
   }
+}
+
+// Request step helpers (the request flow is: blood group, location, hospital, patient, reason, units + urgency, contact, summary)
+function askBloodGroup(from, session, prefix = '') {
+  session.step = 'request_blood_type';
+  return sendList(from, 'Blood request', `${prefix}🩸 *Step 1 of 7: Blood group*\nWhich blood group does the patient need? Choose below, or type it (e.g. O+).`, 'Choose group', [
+    { title: 'Blood group', rows: BLOOD_GROUP_ROWS }
+  ]);
+}
+
+// Partner hospitals near the patient as a list (8 max + other/skip); otherwise the name is typed
+async function askHospital(from, session, intro) {
+  session.step = 'request_hospital';
+  const hasPin = session.data.lat != null && session.data.lng != null;
+  const partners = await pool.query(
+    `SELECT id, name, city FROM facilities
+     WHERE is_partner = TRUE AND does_blood_collection = TRUE AND is_demo IS NOT TRUE
+       AND (city ILIKE $1 OR $1 ILIKE '%' || city || '%'
+            ${hasPin ? `OR (latitude IS NOT NULL AND ${geo.distanceSql('$2', '$3', 'latitude', 'longitude')} <= 30)` : ''})
+     ORDER BY name LIMIT 8`,
+    hasPin ? [session.data.location || '', session.data.lat, session.data.lng] : [session.data.location || '']
+  );
+  if (partners.rows.length === 0) {
+    return sendMessage(from, `${intro}🏥 *Step 3 of 7: Hospital*\nWhich hospital or clinic is the patient in? Type its name, or reply 'skip'.`);
+  }
+  return sendList(from, 'Hospital', `${intro}🏥 *Step 3 of 7: Hospital*\nWhich hospital or clinic is the patient in? LifeDrop partner hospitals are notified directly.`, 'Choose hospital', [
+    { title: 'LifeDrop partners', rows: partners.rows.map(r => ({ id: `hosp_${r.id}`, title: truncate(r.name, 24), description: truncate(r.city || '', 72) })) },
+    { title: 'Other', rows: [{ id: 'hosp_other', title: 'Another hospital' }, { id: 'hosp_skip', title: 'Skip' }] }
+  ]);
+}
+
+function askPatientName(from, session) {
+  session.step = 'request_patient';
+  return sendMessage(from, "👤 *Step 4 of 7: Patient*\nWhat is the patient's name? Initials are fine (e.g. M. N.), or reply 'skip'.");
+}
+
+function showRequestSummary(from, session) {
+  session.step = 'request_consent';
+  return sendButtons(from, requestSummary(session.data), [
+    { id: 'consent_agree', title: 'Confirm request' },
+    { id: 'request_edit', title: 'Start over' },
+    { id: 'consent_decline', title: 'Cancel' }
+  ]);
 }
 
 // Flow Submission Handler
@@ -600,9 +724,8 @@ async function handleLocation(from, loc) {
     session.data.lat = loc.lat;
     session.data.lng = loc.lng;
     session.data.location = town?.name || loc.address || loc.name || 'Shared location';
-    session.step = 'request_hospital';
-    const hospitalHint = loc.name ? ` (your pin says *${loc.name}*)` : '';
-    return sendMessage(from, `📍 Got it${nearLine}. Which hospital or clinic?${hospitalHint} Enter the hospital name, or reply 'skip'.`);
+    const hospitalHint = loc.name ? ` Your pin says *${loc.name}*.` : '';
+    return askHospital(from, session, `📍 Got it${nearLine}.${hospitalHint}\n\n`);
   }
 
   const updated = await pool.query(
@@ -682,8 +805,10 @@ async function sendCommunityLinkIfNeeded(phone) {
 // Request Matching Engine
 async function saveRequestAndMatch(phone, d) {
   const result = await pool.query(
-    `INSERT INTO requests (requester_phone, blood_type_needed, location, hospital_name, units_needed, urgency, lat, lng) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-    [phone, d.blood_type_needed, d.location, d.hospital_name, d.units_needed, d.urgency, d.lat ?? null, d.lng ?? null]
+    `INSERT INTO requests (requester_phone, blood_type_needed, location, hospital_name, units_needed, urgency, lat, lng, facility_id, patient_name, reason, contact_name, contact_phone)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+    [phone, d.blood_type_needed, d.location, d.hospital_name, d.units_needed, d.urgency, d.lat ?? null, d.lng ?? null,
+     d.facility_id || null, d.patient_name || null, d.reason || null, d.contact_name || null, d.contact_phone || null]
   );
   const requestId = result.rows[0].id;
   const neededUnits = d.units_needed || 1;
@@ -692,6 +817,7 @@ async function saveRequestAndMatch(phone, d) {
   const matchedDonors = { rows: await findMatchingDonors(d, notifyCount) };
   const farthestKm = Math.max(0, ...matchedDonors.rows.map(r => r.dist_km ?? 0));
   const radiusLine = matchedDonors.rows.some(r => r.dist_km != null) ? `\n📏 *Search radius:* ${geo.ringFor(farthestKm)} km` : '';
+  const detailLines = `\n👤 *Patient:* ${d.patient_name || 'Not given'}\n📝 *Reason:* ${reasonTitle(d.reason) || 'Not given'}\n📞 *Contact:* ${d.contact_name ? d.contact_name + ' (' + d.contact_phone + ')' : 'Requester'}\n🏷️ *Partner hospital:* ${d.facility_id ? 'Yes (ID ' + d.facility_id + ')' : 'No'}`;
 
   if (matchedDonors.rows.length === 0) {
     // How many donors of this group the area has at all, to tell "nobody registered" from "everyone resting"
@@ -701,11 +827,11 @@ async function saveRequestAndMatch(phone, d) {
       [d.blood_type_needed, `%${d.location}%`]
     );
     await notifyCustomerService(
-      `⚠️ *NO DONOR MATCH FOUND!*\n\n🆔 *Request:* #${requestId}\n👥 *Same blood group in this area:* ${areaPool.rows[0].total} registered, ${areaPool.rows[0].eligible} screened eligible (all resting or waiting)\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'Not specified'}\n⚡ *Urgency:* ${d.urgency}\n📞 *Requester Phone:* ${phone}\n\n*Action Required:* Manual donor outreach needed.`
+      `⚠️ *NO DONOR MATCH FOUND!*\n\n🆔 *Request:* #${requestId}\n👥 *Same blood group in this area:* ${areaPool.rows[0].total} registered, ${areaPool.rows[0].eligible} screened eligible (all resting or waiting)\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'Not specified'}\n⚡ *Urgency:* ${d.urgency}${detailLines}\n📱 *Requester Phone:* ${phone}\n\n*Action Required:* Manual donor outreach needed.`
     );
   } else {
     await notifyCustomerService(
-      `🩸 *New Blood Request Logged*\n\n🆔 *Request:* #${requestId}\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'N/A'}\n⚡ *Urgency:* ${d.urgency}\n👥 *Donors Contacted:* ${matchedDonors.rows.length}${radiusLine}\n📞 *Requester Phone:* ${phone}`
+      `🩸 *New Blood Request Logged*\n\n🆔 *Request:* #${requestId}\n🩸 *Blood Needed:* ${d.blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${d.location}\n🏥 *Hospital:* ${d.hospital_name || 'N/A'}\n⚡ *Urgency:* ${d.urgency}\n👥 *Donors Contacted:* ${matchedDonors.rows.length}${radiusLine}${detailLines}\n📱 *Requester Phone:* ${phone}`
     );
 
     for (const donor of matchedDonors.rows) {
@@ -721,8 +847,24 @@ async function saveRequestAndMatch(phone, d) {
     }
   }
 
+  if (d.facility_id) await notifyFacilityOfRequest(d.facility_id, requestId, phone, d, matchedDonors.rows.length);
+
   scheduleRequesterFollowUp(phone, requestId);
-  return matchedDonors.rows.length;
+  return { matchCount: matchedDonors.rows.length, requestId };
+}
+
+// Partner hospital chosen by the requester: tell its staff a LifeDrop request is coming in for their patient
+async function notifyFacilityOfRequest(facilityId, requestId, requesterPhone, d, donorsContacted) {
+  const result = await pool.query(`SELECT id, name, staff_phone FROM facilities WHERE id = $1 AND is_partner = TRUE`, [facilityId]);
+  const facility = result.rows[0];
+  if (!facility?.staff_phone) return;
+  const contact = d.contact_name ? `${d.contact_name} (${d.contact_phone})` : requesterPhone;
+  await sendToFacility(
+    facility,
+    `🏥 *New LifeDrop blood request for ${facility.name}*\n\n🆔 *Request:* #${requestId}\n🩸 *Blood:* ${d.blood_type_needed} × ${d.units_needed || 1} unit(s)\n⚡ *Urgency:* ${d.urgency}\n👤 *Patient:* ${d.patient_name || 'Not given'}\n📝 *Reason:* ${reasonTitle(d.reason) || 'Not given'}\n📞 *Family contact:* ${contact}\n👥 *Donors contacted:* ${donorsContacted}\n\nWhen a donor accepts, we will send you their name and donation code. Reply *requests* any time to see all requests.`,
+    'hospital_request_alert',
+    [facility.name, `#${requestId}`, `${d.blood_type_needed} x ${d.units_needed || 1}`, d.urgency, d.patient_name || 'Not given', contact]
+  );
 }
 
 // Donor search: nearest pinned donors first (rings up to geo.MAX_RADIUS_KM), then donors without a pin
@@ -860,11 +1002,13 @@ async function handleDonorResponse(from, buttonId) {
   const matchId = buttonId.replace('match_yes_', '').replace('match_no_', '');
 
   const matchRow = await pool.query(
-    `SELECT m.request_id, m.response, m.contacted_at, r.units_needed, r.requester_phone, r.blood_type_needed, r.location, r.hospital_name, r.urgency     FROM matches m JOIN requests r ON r.id = m.request_id WHERE m.id = $1`,
+    `SELECT m.request_id, m.response, m.contacted_at, r.units_needed, r.requester_phone, r.blood_type_needed, r.location, r.hospital_name, r.urgency,
+       r.contact_name, r.contact_phone, r.facility_id
+     FROM matches m JOIN requests r ON r.id = m.request_id WHERE m.id = $1`,
     [matchId]
   );
   if (matchRow.rows.length === 0) return;
-  const { request_id, response: existingResponse, contacted_at, units_needed, requester_phone, blood_type_needed, location, hospital_name, urgency } = matchRow.rows[0];
+  const { request_id, response: existingResponse, contacted_at, units_needed, requester_phone, blood_type_needed, location, hospital_name, urgency, contact_name, contact_phone, facility_id } = matchRow.rows[0];
 
   if (existingResponse) return;
 
@@ -895,15 +1039,29 @@ async function handleDonorResponse(from, buttonId) {
 
   const confirmCode = await generateConfirmCode();
   await pool.query(`UPDATE matches SET response = 'yes', responded_at = NOW(), confirm_code = $2 WHERE id = $1`, [matchId, confirmCode]);
-  const donorInfo = await pool.query(`SELECT name FROM donors WHERE phone = $1`, [from]);
+  const donorInfo = await pool.query(`SELECT name, blood_type FROM donors WHERE phone = $1`, [from]);
   const donorName = donorInfo.rows[0]?.name || 'A donor';
+  const familyContact = contact_name ? `${contact_name}: ${contact_phone}` : requester_phone;
 
-  await sendMessage(from, `Thank you! We've noted your response. The requester's contact will follow shortly so you can coordinate. Reminder: any transport/feeding support is arranged directly between you two. 🙏\n\n🔑 Your donation code: *${confirmCode}*\nAt the blood bank, show this code and your ID card. The staff will confirm your donation with it.`);
+  await sendMessage(from, `Thank you, ${donorName}! 🙏 You are confirmed as a donor for request #${request_id}.\n\n🏥 *Where:* ${hospital_name || 'Hospital not specified'}, ${location}\n📞 *Family contact:* ${familyContact}\n\n🔑 Your donation code: *${confirmCode}*\nAt the blood bank, show this code and your ID card. The staff will confirm your donation with it.\n\nReminder: any transport/feeding support is arranged directly with the family. LifeDrop does not pay donors.`);
   await sendMessage(
     requester_phone,
-    `Good news! ${donorName} (${from}) has agreed to donate ${blood_type_needed}${hospital_name ? ' at ' + hospital_name : ''} in ${location}. Please reach out to coordinate directly.`
+    `Good news! ${donorName} (${from}) has agreed to donate ${blood_type_needed}${hospital_name ? ' at ' + hospital_name : ''} in ${location} for request #${request_id}.${contact_name ? `\n\nWe gave the donor ${contact_name}'s number (${contact_phone}) as the contact.` : ''} Please reach out to coordinate directly.`
   );
   await sendDonationConfirmButtons(from, requester_phone, donorName, matchId);
+
+  if (facility_id) {
+    const fac = await pool.query(`SELECT id, name, staff_phone FROM facilities WHERE id = $1 AND is_partner = TRUE`, [facility_id]);
+    if (fac.rows[0]?.staff_phone) {
+      const facility = fac.rows[0];
+      await sendToFacility(
+        facility,
+        `🙋 *Donor on the way: request #${request_id}*\n\n👤 *Donor:* ${donorName}\n🩸 *Blood group (self-reported):* ${donorInfo.rows[0]?.blood_type || blood_type_needed}\n🔑 *Donation code:* ${confirmCode}\n📞 *Family contact:* ${familyContact}\n\nAfter the donation, check the donor's ID card and send the code to this number to confirm.`,
+        'hospital_donor_incoming',
+        [facility.name, donorName, donorInfo.rows[0]?.blood_type || blood_type_needed, confirmCode]
+      );
+    }
+  }
 
   const newAcceptedCount = acceptedSoFar + 1;
   const minutesToReply = contacted_at ? Math.max(0, Math.round((Date.now() - new Date(contacted_at).getTime()) / 60000)) : null;
@@ -919,7 +1077,7 @@ async function handleDonorResponse(from, buttonId) {
       await pool.query(`UPDATE matches SET response = 'not_needed' WHERE id = $1`, [pm.id]);
       await sendMessage(pm.phone, "Thanks so much for offering to help! We've secured enough donors for this request. We will contact you next time there is a match. 🙏");
     }
-    await pool.query(`UPDATE requests SET status = 'fulfilled' WHERE id = $1`, [request_id]);
+    await pool.query(`UPDATE requests SET status = 'fulfilled', fulfilled_at = NOW() WHERE id = $1`, [request_id]);
     await notifyCustomerService(
       `🎉 *Request Fulfilled*\n\n🆔 *Request:* #${request_id}\n🩸 *Blood:* ${blood_type_needed} (${neededUnits} unit(s))\n📍 *Location:* ${location}\n📞 *Requester:* ${requester_phone}\n🔕 *Other donors told not needed:* ${pendingMatches.rows.length}`
     );
@@ -1096,6 +1254,121 @@ async function handleFacilityConfirmation(from, buttonId) {
   await notifyCustomerService(
     `✅ *Donation Confirmed by Blood Bank*\n\n🏥 *Facility:* ${facility.name}\n👤 *Donor:* ${name} (${phone})\n🔑 *Code:* ${confirm_code}\n⏳ *Next eligible in:* ${donationWaitDays(gender)} days`
   );
+}
+
+// Admin commands from the CS phone / ADMIN_PHONES (see admin.js for the syntax)
+async function handleAdminCommand(from, command) {
+  switch (command.cmd) {
+    case 'stats':
+      return sendStatsReport(from, command.days);
+
+    case 'help':
+      return sendMessage(from, HELP_TEXT);
+
+    case 'add_invalid':
+      return sendMessage(from, `⚠️ Could not read that. Use:\nadd${command.kind} Name | City | Staff phone\n\nExample:\nadd${command.kind} Buea Regional Hospital | Buea | 677123456`);
+
+    case 'add': {
+      const f = command.facility;
+      const existing = await pool.query(`SELECT id, name FROM facilities WHERE regexp_replace(staff_phone, '\\D', '', 'g') = $1`, [f.staff_phone]);
+      if (existing.rows.length > 0) {
+        await pool.query(`UPDATE facilities SET is_partner = TRUE WHERE id = $1`, [existing.rows[0].id]);
+        return sendMessage(from, `ℹ️ ${f.staff_phone} is already registered as *${existing.rows[0].name}* (ID ${existing.rows[0].id}). It is now active as a partner.`);
+      }
+      const inserted = await pool.query(
+        `INSERT INTO facilities (name, type, city, staff_phone, is_partner, does_blood_collection, does_lab_tests)
+         VALUES ($1, $2, $3, $4, TRUE, $5, $6) RETURNING id`,
+        [f.name, f.type, f.city, f.staff_phone, f.does_blood_collection, f.does_lab_tests]
+      );
+      const id = inserted.rows[0].id;
+      const welcome = await sendToFacility(
+        { id, name: f.name, staff_phone: f.staff_phone },
+        `🏥 Welcome to LifeDrop, ${f.name}!\n\nThis WhatsApp number is now registered as your facility's LifeDrop line.\n\n${facilityMenuText(f.name)}`,
+        'hospital_admin_notice',
+        [f.name, 'This WhatsApp number is now registered as your LifeDrop line. Reply "menu" to see what you can do.']
+      );
+      return sendMessage(
+        from,
+        `✅ *${f.name}* added (ID ${id}).\n📍 ${f.city}\n📞 ${f.staff_phone}\n🏷️ ${f.type}\n\n${welcome ? 'A welcome message was sent to the staff phone.' : '⚠️ The welcome message could not be delivered yet. Ask the staff to send "menu" to the LifeDrop number once, or get the hospital_admin_notice template approved.'}`
+      );
+    }
+
+    case 'list': {
+      const result = await pool.query(
+        `SELECT id, name, type, city, staff_phone, is_partner FROM facilities WHERE is_demo IS NOT TRUE ORDER BY is_partner DESC, city, name`
+      );
+      if (result.rows.length === 0) return sendMessage(from, "No hospitals or labs registered yet. Use:\naddhospital Name | City | Staff phone");
+      const lines = result.rows.map(r => `${r.is_partner ? '✅' : '⏸️'} *${r.id}* · ${r.name} (${r.type}, ${r.city || '?'}) · ${r.staff_phone || 'no phone'}`);
+      return sendMessage(from, `🏥 *Registered facilities* (${result.rows.length})\n\n${lines.join('\n')}\n\n✅ active partner · ⏸️ not active`);
+    }
+
+    case 'remove': {
+      const result = await pool.query(`UPDATE facilities SET is_partner = FALSE WHERE id = $1 RETURNING name`, [command.id]);
+      if (result.rows.length === 0) return sendMessage(from, `No facility with ID ${command.id}. Send "hospitals" to see the list.`);
+      return sendMessage(from, `⏸️ *${result.rows[0].name}* is no longer an active partner. Its history is kept.`);
+    }
+  }
+}
+
+function facilityMenuText(facilityName) {
+  return [
+    `🏥 *LifeDrop: ${facilityName}*`,
+    '',
+    'What you can do from this number:',
+    '• *requests*: open blood requests for your facility',
+    '• Send a donor\'s code, e.g. *LD-48213*: confirm their donation (check their ID card first)',
+    '• *results LD-48213*: record the blood group and screening outcome',
+    '',
+    'Never send infection test results through LifeDrop.'
+  ].join('\n');
+}
+
+// Partner staff phone: hospital menu and "requests". Returns false for everyone else.
+async function handleFacilityMessage(from, text) {
+  const facility = await getPartnerFacility(from);
+  if (!facility) return false;
+
+  if (text.toLowerCase() === 'requests') {
+    const open = await pool.query(
+      `SELECT r.id, r.blood_type_needed, r.units_needed, r.urgency, r.patient_name, r.reason, r.created_at,
+         COALESCE(r.contact_name, 'Requester') AS contact_name, COALESCE(r.contact_phone, r.requester_phone) AS contact_phone,
+         (SELECT string_agg(d.name || ' ' || m.confirm_code || CASE WHEN m.donation_confirmed THEN ' ✅' ELSE '' END, ', ')
+            FROM matches m JOIN donors d ON d.id = m.donor_id WHERE m.request_id = r.id AND m.response = 'yes') AS donors
+       FROM requests r
+       WHERE r.facility_id = $1 AND r.created_at >= NOW() - INTERVAL '14 days'
+       ORDER BY r.created_at DESC LIMIT 10`,
+      [facility.id]
+    );
+    if (open.rows.length === 0) return sendMessage(from, `No LifeDrop requests for ${facility.name} in the last 14 days.`).then(() => true);
+    const blocks = open.rows.map(r =>
+      `🆔 *#${r.id}* · ${formatTime(r.created_at)}\n🩸 ${r.blood_type_needed} × ${r.units_needed || 1} · ⚡ ${r.urgency}\n👤 ${r.patient_name || 'Patient name not given'}${r.reason ? ' · ' + (reasonTitle(r.reason) || r.reason) : ''}\n📞 ${r.contact_name}: ${r.contact_phone}\n🙋 ${r.donors || 'No donor confirmed yet'}`
+    );
+    await sendMessage(from, `🏥 *LifeDrop requests for ${facility.name}* (last 14 days)\n\n${blocks.join('\n\n')}`);
+    return true;
+  }
+
+  await sendMessage(from, facilityMenuText(facility.name));
+  return true;
+}
+
+// Message a hospital's staff phone: plain text inside its 24h window, else an approved template.
+// Returns true if something was delivered; tells support if not.
+async function sendToFacility(facility, text, templateName, templateParams) {
+  try {
+    await sendMessage(facility.staff_phone, text);
+    return true;
+  } catch (err) {
+    try {
+      await sendTemplate(facility.staff_phone, templateName, templateParams.map(p => toTemplateParam(p)));
+      return true;
+    } catch (templateErr) {
+      console.warn(`Could not reach facility ${facility.id}:`, templateErr.response?.data?.error?.message || templateErr.message);
+      await notifyCustomerService(
+        `⚠️ *Could not reach hospital*\n\n🏥 *Facility:* ${facility.name} (ID ${facility.id})\n📞 *Staff phone:* ${facility.staff_phone}\n📨 *Message:* ${text.split('\n')[0]}\n\nAsk the staff to message the LifeDrop number, or check that the '${templateName}' template is approved.`
+      );
+      return false;
+    }
+  }
 }
 
 // Donation results, step 1: staff send "results LD-48213" for a confirmed donation

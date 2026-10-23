@@ -30,14 +30,28 @@ test('report title and details split for the ops template', () => {
   assert.strictEqual(details, '🆔 Request: #42 | 📍 Location: Buea');
 });
 
-test('stats report includes key numbers and rates', () => {
-  const text = formatStatsReport(stats, 7, new Date(Date.UTC(2026, 9, 23, 13, 5)));
+test('stats report includes key numbers, rates and explanations in 3 short messages', () => {
+  const full = {
+    ...stats,
+    donors: { ...stats.donors, unknown_type: '6', with_pin: '100' },
+    requests: { ...stats.requests, units: '6', urgent: '2', routine: '1', partner: '1', median_minutes_to_fulfil: 95 },
+    donorsByCity: [{ city: 'buea', count: '50', ready: '40' }],
+    readyByType: [{ blood_type: 'O+', count: '1' }],
+    demandByType: [{ blood_type_needed: 'O+', units: '3' }],
+    activity: { tests_booked: '7' }
+  };
+  const parts = formatStatsReport(full, 7, new Date(Date.UTC(2026, 9, 23, 13, 5)));
+  assert.strictEqual(parts.length, 3);
+  for (const p of parts) assert.ok(p.length < 4000);
+  const text = parts.join('\n');
   assert.match(text, /last 7 days/);
-  assert.match(text, /Ready to donate now: 241/);
+  assert.match(text, /Ready now: \*241\*: can be matched today/);
   assert.match(text, /Fulfilled: 3 \(75%\)/);
   assert.match(text, /Yes rate: 50%/);
-  assert.match(text, /Median time to a yes: 7 min/);
-  assert.match(text, /O\+: 120/);
+  assert.match(text, /time to a yes: 7 min/);
+  assert.match(text, /time to fulfil: 1.6 h/);
+  assert.match(text, /O\+: 1 ready · 3 unit\(s\) asked ⚠️ short/);
+  assert.match(text, /buea: 50 \(40 ready\)/);
 });
 
 test('daily summary gives 12 string params in template order', () => {

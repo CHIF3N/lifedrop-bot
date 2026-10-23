@@ -35,48 +35,91 @@ function splitReport(text) {
 const pct = (part, whole) => (whole > 0 ? `${Math.round((part / whole) * 100)}%` : '-');
 const num = (v) => Number(v || 0);
 
-// Full analytics text for the support line ("stats" command and the daily report)
+const minutesText = (m) => {
+  if (m == null) return '-';
+  const v = Number(m);
+  if (v < 60) return `${Math.round(v)} min`;
+  if (v < 48 * 60) return `${(v / 60).toFixed(1)} h`;
+  return `${(v / 1440).toFixed(1)} days`;
+};
+
+// Full analytics for the admin phones ("stats" command and the daily report), split into 3 WhatsApp messages
+// so each stays well under the 4096-character limit. Each line says what the number means.
 function formatStatsReport(s, days, now = new Date()) {
   const period = days === 1 ? 'last 24 hours' : `last ${days} days`;
-  const bloodTypes = s.bloodTypes.map(b => `${b.blood_type || '?'}: ${b.count}`).join(' · ') || '-';
-  const topPlaces = s.topLocations.map(l => `${l.location} (${l.count})`).join(', ') || '-';
-  const median = s.matches.median_minutes_to_yes != null ? `${Math.round(s.matches.median_minutes_to_yes)} min` : '-';
+  const header = `📊 *LifeDrop Analytics: ${period}*\n🕒 ${formatTime(now)}`;
+  const d = s.donors;
+  const r = s.requests;
+  const m = s.matches;
 
-  return [
-    `📊 *LifeDrop Analytics (${period})*`,
-    `🕒 ${formatTime(now)}`,
+  // Supply vs demand per blood group: donors ready now vs units requested in the period
+  const groups = ['O+', 'O-', 'A+', 'A-', 'B+', 'B-', 'AB+', 'AB-'];
+  const ready = Object.fromEntries((s.readyByType || []).map(x => [x.blood_type, num(x.count)]));
+  const demand = Object.fromEntries((s.demandByType || []).map(x => [x.blood_type_needed, num(x.units)]));
+  const supplyLines = groups
+    .filter(g => ready[g] || demand[g])
+    .map(g => `• ${g}: ${ready[g] || 0} ready · ${demand[g] || 0} unit(s) asked${(demand[g] || 0) > (ready[g] || 0) ? ' ⚠️ short' : ''}`);
+
+  const donorsPart = [
+    header,
     '',
-    '👥 *Donors*',
-    `• Total: ${num(s.donors.total)} (new: ${num(s.donors.new)})`,
-    `• Ready to donate now: ${num(s.donors.ready)}`,
-    `• Resting after donation: ${num(s.donors.resting)}`,
-    `• Waiting (temporary): ${num(s.donors.waiting)}`,
-    `• Needs team review: ${num(s.donors.needs_review)}`,
-    `• Paused (pregnancy / blood bank): ${num(s.donors.paused)}`,
-    `• Not eligible: ${num(s.donors.not_eligible)}`,
-    `• Verified by blood bank: ${num(s.donors.verified)}`,
-    `• Blood groups: ${bloodTypes}`,
+    '👥 *DONORS* (totals today)',
+    `• Registered: *${num(d.total)}* (+${num(d.new)} new in ${period})`,
+    `• ✅ Ready now: *${num(d.ready)}*: can be matched today`,
+    `• 😴 Resting: ${num(d.resting)}: donated recently (90 days men / 120 women)`,
+    `• ⏳ Waiting: ${num(d.waiting)}: short wait from health answers (e.g. malaria, tattoo)`,
+    `• 🔎 Needs review: ${num(d.needs_review)}: team must check answers before matching`,
+    `• ⏸️ Paused: ${num(d.paused)}: pregnant/breastfeeding, or blood bank follow-up`,
+    `• ❌ Not eligible: ${num(d.not_eligible)}: ruled out by screening`,
+    `• 🏅 Verified: ${num(d.verified)}: identity checked by a blood bank`,
+    `• ❓ Blood group unknown: ${num(d.unknown_type)}: cannot be matched until tested`,
+    `• 📍 Shared location pin: ${num(d.with_pin)} of ${num(d.total)}`,
     '',
-    '🩸 *Requests*',
-    `• New: ${num(s.requests.total)} (emergency: ${num(s.requests.emergency)})`,
-    `• Fulfilled: ${num(s.requests.fulfilled)} (${pct(num(s.requests.fulfilled), num(s.requests.total))})`,
-    `• No donor found: ${num(s.requests.no_match)}`,
-    `• Top places: ${topPlaces}`,
+    '🏙️ *Donors by city*',
+    ...(s.donorsByCity || []).map(c => `• ${c.city || 'unknown'}: ${c.count} (${c.ready} ready)`),
     '',
-    '📨 *Donor replies*',
-    `• Contacted: ${num(s.matches.contacted)}`,
-    `• Yes: ${num(s.matches.yes)} · No: ${num(s.matches.no)} · Not needed: ${num(s.matches.not_needed)} · No reply: ${num(s.matches.no_reply)}`,
-    `• Yes rate: ${pct(num(s.matches.yes), num(s.matches.contacted))}`,
-    `• Median time to a yes: ${median}`,
-    '',
-    '✅ *Donations*',
-    `• Confirmed: ${num(s.donations.confirmed)} (blood bank: ${num(s.donations.by_facility)}, self-reported: ${num(s.donations.self_reported)})`,
-    `• Results recorded: ${num(s.donations.results)}`,
-    '',
-    '🏥 *Network*',
-    `• Partner facilities: ${num(s.facilities.partners)}`,
-    `• Home lab test waitlist: ${num(s.waitlist.home_lab)}`
+    '🩸 *Supply vs demand*',
+    ...(supplyLines.length ? supplyLines : ['• No requests or ready donors yet'])
   ].join('\n');
+
+  const requestsPart = [
+    header,
+    '',
+    `🆘 *REQUESTS* (${period})`,
+    `• New requests: *${num(r.total)}* (${num(r.units)} unit(s) in total)`,
+    `• By urgency: 🔴 ${num(r.emergency)} emergency · 🟠 ${num(r.urgent)} urgent · 🟢 ${num(r.routine)} routine`,
+    `• ✅ Fulfilled: ${num(r.fulfilled)} (${pct(num(r.fulfilled), num(r.total))}): enough donors said yes`,
+    `• ⏱️ Typical time to fulfil: ${minutesText(r.median_minutes_to_fulfil)}: from request to last needed yes`,
+    `• 🚫 No donor found: ${num(r.no_match)}: nobody available to contact, support had to help`,
+    `• 🏥 Through partner hospitals: ${num(r.partner)}`,
+    `• 📍 Top places: ${(s.topLocations || []).map(l => `${l.location} (${l.count})`).join(', ') || '-'}`,
+    '',
+    `📨 *DONOR REPLIES* (${period})`,
+    `• Donors contacted: ${num(m.contacted)}`,
+    `• 👍 Yes: ${num(m.yes)} · 👎 No: ${num(m.no)} · 🔕 No reply: ${num(m.no_reply)} · ✋ Not needed: ${num(m.not_needed)}`,
+    `• Yes rate: ${pct(num(m.yes), num(m.contacted))}: share of contacted donors who said yes`,
+    `• Reply rate: ${pct(num(m.contacted) - num(m.no_reply), num(m.contacted))}: share who answered at all`,
+    `• ⚡ Typical time to a yes: ${minutesText(m.median_minutes_to_yes)}`
+  ].join('\n');
+
+  const activityPart = [
+    header,
+    '',
+    `✅ *DONATIONS* (${period})`,
+    `• Confirmed donations: *${num(s.donations.confirmed)}*`,
+    `   ↳ by a blood bank (code checked): ${num(s.donations.by_facility)}`,
+    `   ↳ self-reported (donor/family tapped yes): ${num(s.donations.self_reported)}`,
+    `• Lab results recorded: ${num(s.donations.results)}`,
+    '',
+    '🏥 *NETWORK* (totals today)',
+    `• Active partner hospitals/labs: ${num(s.facilities.partners)}`,
+    `• Free tests booked (${period}): ${num(s.activity?.tests_booked)}`,
+    `• Home lab test waitlist: ${num(s.waitlist.home_lab)}`,
+    '',
+    'Reply *stats 30* for 30 days, *admin* for all commands.'
+  ].join('\n');
+
+  return [donorsPart, requestsPart, activityPart];
 }
 
 // Values for the lifedrop_daily_summary template, in {{1}}..{{12}} order
