@@ -4,199 +4,252 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
-  <title>LifeDrop Admin</title>
+  <title>LifeDrop Control</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23e11d48' d='M12 2C9 6.5 5 10.6 5 15a7 7 0 0 0 14 0c0-4.4-4-8.5-7-13z'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/admin/style.css">
+  <script src="/admin/vendor/chart.umd.js" defer></script>
   <script src="/admin/app.js" defer></script>
 </head>
 <body>
+  <svg width="0" height="0" class="sprite" aria-hidden="true">
+    <symbol id="i-drop" viewBox="0 0 24 24"><path d="M12 2.5C9 7 5.5 10.8 5.5 15a6.5 6.5 0 0 0 13 0c0-4.2-3.5-8-6.5-12.5z"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.6-3.6 3.3-5.5 6.5-5.5s5.9 1.9 6.5 5.5"/><circle cx="17" cy="9" r="2.6"/><path d="M16.5 14.6c2.6.2 4.5 1.9 5 4.9"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3 2.5 20h19z"/><path d="M12 10v4.5M12 17.2v.3"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></symbol>
+    <symbol id="i-hospital" viewBox="0 0 24 24"><rect x="4" y="3.5" width="16" height="17" rx="2"/><path d="M12 7.5v6M9 10.5h6M9.5 20.5v-3.5h5v3.5"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 2.5h8l4.5 4.5v14.5H6z"/><path d="M14 2.5V7h4.5M9 12h6M9 16h6"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M21.5 2.5 10.5 13.5"/><path d="M21.5 2.5 14.5 21.5l-4-8-8-4z"/></symbol>
+    <symbol id="i-out" viewBox="0 0 24 24"><path d="M15 4h4.5v16H15M10 8l-4 4 4 4M6 12h10"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.5L4 8M4 4v4h4M4 13a8 8 0 0 0 14.6 4.5L20 16M20 20v-4h-4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+  </svg>
+
   <section id="login" class="login" hidden>
-    <form id="login-form" class="card">
-      <h1>🩸 LifeDrop Admin</h1>
-      <label>Admin key <input id="login-key" type="password" autocomplete="current-password" required></label>
-      <button type="submit">Log in</button>
+    <form id="login-form" class="login-card">
+      <div class="brand big"><svg class="brand-mark"><use href="#i-drop"/></svg><span>LifeDrop <em>Control</em></span></div>
+      <p class="muted">Sign in with the admin key set on Render.</p>
+      <label class="field">Admin key <input id="login-key" type="password" autocomplete="current-password" required></label>
+      <button type="submit" class="btn primary block">Sign in</button>
       <p id="login-error" class="error"></p>
     </form>
   </section>
 
-  <div id="app" hidden>
-    <header>
-      <strong>🩸 LifeDrop Admin</strong>
-      <nav id="tabs">
-        <button data-tab="overview" class="active">Overview</button>
-        <button data-tab="donors">Donors</button>
-        <button data-tab="requests">Requests</button>
-        <button data-tab="matches">Matches</button>
-        <button data-tab="facilities">Hospitals</button>
-        <button data-tab="templates">Templates</button>
-        <button data-tab="broadcast">Broadcast</button>
+  <div id="app" class="shell" hidden>
+    <aside class="sidebar">
+      <div class="brand"><svg class="brand-mark"><use href="#i-drop"/></svg><span>LifeDrop <em>Control</em></span></div>
+      <nav id="tabs" class="nav">
+        <button data-tab="overview" class="active"><svg><use href="#i-grid"/></svg>Overview</button>
+        <button data-tab="donors"><svg><use href="#i-users"/></svg>Donors<span class="nav-count" id="nav-review" hidden></span></button>
+        <button data-tab="requests"><svg><use href="#i-alert"/></svg>Requests<span class="nav-count" id="nav-open" hidden></span></button>
+        <button data-tab="matches"><svg><use href="#i-link"/></svg>Matches</button>
+        <button data-tab="facilities"><svg><use href="#i-hospital"/></svg>Hospitals &amp; labs</button>
+        <button data-tab="templates"><svg><use href="#i-file"/></svg>Templates</button>
+        <button data-tab="broadcast"><svg><use href="#i-send"/></svg>Broadcast</button>
       </nav>
-      <label class="reveal"><input type="checkbox" id="reveal"> Show phone numbers</label>
-      <button id="logout" class="ghost">Log out</button>
-    </header>
-    <p id="toast" class="toast" hidden></p>
-
-    <main>
-      <section data-panel="overview">
-        <div class="row">
-          <h2>Overview</h2>
-          <select id="stats-days">
-            <option value="1">Last 24 hours</option>
-            <option value="7" selected>Last 7 days</option>
-            <option value="30">Last 30 days</option>
-            <option value="365">Last year</option>
-          </select>
-          <button id="stats-refresh" class="ghost">Refresh</button>
+      <div class="sidebar-foot">
+        <div class="conn"><span class="dot"></span><span id="conn-text">Live database</span></div>
+        <div class="foot-actions">
+          <button id="theme" class="icon-btn" title="Light / dark"><svg><use href="#i-moon"/></svg></button>
+          <button id="logout" class="icon-btn" title="Sign out"><svg><use href="#i-out"/></svg></button>
         </div>
-        <div id="stat-cards" class="cards"></div>
-        <details>
-          <summary>Full report (same text the admin phone gets)</summary>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div id="local-banner" class="banner" hidden>Local mode: real data, but sending is turned off. Broadcasts go out from the live dashboard on Render.</div>
+
+      <!-- Overview -->
+      <section data-panel="overview">
+        <header class="page-head">
+          <div>
+            <h1>Overview</h1>
+            <p class="muted" id="updated">Loading…</p>
+          </div>
+          <div class="head-actions">
+            <div class="segmented" id="period">
+              <button data-days="1">24h</button>
+              <button data-days="7">7d</button>
+              <button data-days="30" class="active">30d</button>
+              <button data-days="90">90d</button>
+            </div>
+            <button id="stats-refresh" class="icon-btn" title="Refresh"><svg><use href="#i-refresh"/></svg></button>
+          </div>
+        </header>
+
+        <div class="kpis" id="kpis"></div>
+        <div class="chips-row" id="mini-stats"></div>
+
+        <div class="grid">
+          <article class="panel span-2">
+            <div class="panel-head"><h2>Activity</h2><span class="muted small">per day, Cameroon time</span></div>
+            <div class="chart tall"><canvas id="chart-activity"></canvas></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h2>Donor readiness</h2><span class="muted small">all donors now</span></div>
+            <div class="chart"><canvas id="chart-status"></canvas></div>
+          </article>
+          <article class="panel span-2">
+            <div class="panel-head"><h2>Blood supply vs demand</h2><span class="muted small" id="supply-note"></span></div>
+            <div class="chart"><canvas id="chart-blood"></canvas></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h2>Donor replies</h2><span class="muted small" id="funnel-note"></span></div>
+            <div id="funnel" class="funnel"></div>
+          </article>
+          <article class="panel span-2">
+            <div class="panel-head"><h2>Donors by town</h2><span class="muted small">top towns</span></div>
+            <div class="chart"><canvas id="chart-cities"></canvas></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h2>Open requests</h2><button class="link" data-goto="requests">See all</button></div>
+            <div id="open-requests" class="req-list"></div>
+          </article>
+        </div>
+
+        <details class="panel report">
+          <summary>Full text report (same as the admin phone gets)</summary>
           <pre id="stats-report"></pre>
         </details>
       </section>
 
+      <!-- Donors -->
       <section data-panel="donors" hidden>
-        <h2>Donors</h2>
-        <form class="filters" data-list="donors">
+        <header class="page-head"><div><h1>Donors</h1><p class="muted">Everyone registered with the bot. Review donors flagged by screening.</p></div>
+          <label class="toggle"><input type="checkbox" class="reveal"><svg><use href="#i-eye"/></svg>Show numbers</label></header>
+        <form class="toolbar" data-list="donors">
+          <input name="q" type="search" placeholder="Search name or phone">
           <select name="status">
-            <option value="">Any status</option>
-            <option value="needs_review">🔎 Needs review</option>
+            <option value="">All statuses</option>
+            <option value="needs_review">Needs review</option>
             <option value="eligible">Eligible</option>
             <option value="needs_update">Needs update</option>
             <option value="on_hold">On hold</option>
             <option value="not_eligible">Not eligible</option>
           </select>
-          <select name="blood_type" class="blood-types"><option value="">Any blood type</option></select>
-          <input name="city" placeholder="City / town">
-          <input name="q" placeholder="Name or phone">
-          <button type="submit">Filter</button>
+          <select name="blood_type" class="blood-types"><option value="">All blood types</option></select>
+          <input name="city" placeholder="Town">
+          <button type="submit" class="btn">Apply</button>
         </form>
-        <div class="table-wrap"><table id="table-donors"></table></div>
+        <div class="table-card"><table id="table-donors"></table></div>
       </section>
 
+      <!-- Requests -->
       <section data-panel="requests" hidden>
-        <h2>Requests</h2>
-        <form class="filters" data-list="requests">
-          <select name="status">
-            <option value="">Any status</option>
-            <option value="open">Open</option>
-            <option value="fulfilled">Fulfilled</option>
-          </select>
-          <select name="blood_type" class="blood-types"><option value="">Any blood type</option></select>
-          <select name="urgency">
-            <option value="">Any urgency</option>
-            <option>Emergency</option><option>Urgent</option><option>Routine</option>
-          </select>
-          <input name="city" placeholder="City / town">
-          <button type="submit">Filter</button>
+        <header class="page-head"><div><h1>Requests</h1><p class="muted">Blood requests and how many donors said yes.</p></div>
+          <label class="toggle"><input type="checkbox" class="reveal"><svg><use href="#i-eye"/></svg>Show numbers</label></header>
+        <form class="toolbar" data-list="requests">
+          <select name="status"><option value="">All statuses</option><option value="open">Open</option><option value="fulfilled">Fulfilled</option></select>
+          <select name="blood_type" class="blood-types"><option value="">All blood types</option></select>
+          <select name="urgency"><option value="">All urgency</option><option>Emergency</option><option>Urgent</option><option>Routine</option></select>
+          <input name="city" placeholder="Town">
+          <button type="submit" class="btn">Apply</button>
         </form>
-        <div class="table-wrap"><table id="table-requests"></table></div>
+        <div class="table-card"><table id="table-requests"></table></div>
       </section>
 
+      <!-- Matches -->
       <section data-panel="matches" hidden>
-        <h2>Matches (donors contacted)</h2>
-        <form class="filters" data-list="matches">
-          <select name="response">
-            <option value="">Any reply</option>
-            <option value="yes">Yes</option>
-            <option value="no">No</option>
-            <option value="no_reply">No reply</option>
-            <option value="not_needed">Not needed</option>
-          </select>
+        <header class="page-head"><div><h1>Matches</h1><p class="muted">Every donor the bot contacted, and their reply.</p></div>
+          <label class="toggle"><input type="checkbox" class="reveal"><svg><use href="#i-eye"/></svg>Show numbers</label></header>
+        <form class="toolbar" data-list="matches">
+          <select name="response"><option value="">All replies</option><option value="yes">Yes</option><option value="no">No</option><option value="no_reply">No reply</option><option value="not_needed">Not needed</option></select>
           <input name="request_id" placeholder="Request #" inputmode="numeric">
-          <button type="submit">Filter</button>
+          <button type="submit" class="btn">Apply</button>
         </form>
-        <div class="table-wrap"><table id="table-matches"></table></div>
+        <div class="table-card"><table id="table-matches"></table></div>
       </section>
 
+      <!-- Facilities -->
       <section data-panel="facilities" hidden>
-        <h2>Hospitals and labs</h2>
-        <form id="facility-form" class="card form-grid">
-          <h3>Register a hospital or lab</h3>
-          <label>Name <input name="name" required placeholder="Buea Regional Hospital"></label>
-          <label>City / town <input name="city" required placeholder="Buea"></label>
-          <label>Staff WhatsApp phone <input name="staff_phone" required placeholder="677123456"></label>
-          <label>Type
-            <select name="type">
-              <option value="hospital">Hospital</option>
-              <option value="lab">Lab</option>
-              <option value="blood_bank">Blood bank</option>
-            </select>
+        <header class="page-head"><div><h1>Hospitals &amp; labs</h1><p class="muted">Partner facilities. Their staff phone gets requests and confirms donations.</p></div>
+          <label class="toggle"><input type="checkbox" class="reveal"><svg><use href="#i-eye"/></svg>Show numbers</label></header>
+        <form id="facility-form" class="panel form-grid">
+          <h2 class="wide">Register a hospital or lab</h2>
+          <label class="field">Name <input name="name" required placeholder="Buea Regional Hospital"></label>
+          <label class="field">Town <input name="city" required placeholder="Buea"></label>
+          <label class="field">Staff WhatsApp number <input name="staff_phone" required placeholder="677123456"></label>
+          <label class="field">Type
+            <select name="type"><option value="hospital">Hospital</option><option value="lab">Lab</option><option value="blood_bank">Blood bank</option></select>
           </label>
-          <label class="check"><input type="checkbox" name="is_partner" checked> Active partner</label>
-          <label class="check"><input type="checkbox" name="does_blood_collection" checked> Collects blood</label>
-          <label class="check"><input type="checkbox" name="does_lab_tests"> Does lab tests</label>
-          <button type="submit">Register</button>
-          <p class="hint">No WhatsApp message is sent. Ask the staff to send "menu" to the LifeDrop number.</p>
+          <div class="wide checks">
+            <label class="check"><input type="checkbox" name="is_partner" checked> Active partner</label>
+            <label class="check"><input type="checkbox" name="does_blood_collection" checked> Collects blood</label>
+            <label class="check"><input type="checkbox" name="does_lab_tests"> Does lab tests</label>
+          </div>
+          <div class="wide row-end">
+            <p class="muted small">No WhatsApp message is sent. Ask the staff to send "menu" to the LifeDrop number.</p>
+            <button type="submit" class="btn primary">Register</button>
+          </div>
         </form>
-        <form class="filters" data-list="facilities">
-          <select name="type">
-            <option value="">Any type</option>
-            <option value="hospital">Hospital</option>
-            <option value="lab">Lab</option>
-            <option value="blood_bank">Blood bank</option>
-          </select>
-          <select name="partner">
-            <option value="">Partner or not</option>
-            <option value="yes">Active partners</option>
-            <option value="no">Not active</option>
-          </select>
-          <button type="submit">Filter</button>
+        <form class="toolbar" data-list="facilities">
+          <select name="type"><option value="">All types</option><option value="hospital">Hospital</option><option value="lab">Lab</option><option value="blood_bank">Blood bank</option></select>
+          <select name="partner"><option value="">Partner or not</option><option value="yes">Active partners</option><option value="no">Not active</option></select>
+          <button type="submit" class="btn">Apply</button>
         </form>
-        <div class="table-wrap"><table id="table-facilities"></table></div>
+        <div class="table-card"><table id="table-facilities"></table></div>
       </section>
 
+      <!-- Templates -->
       <section data-panel="templates" hidden>
-        <div class="row">
-          <h2>WhatsApp templates</h2>
-          <button id="templates-refresh" class="ghost">Check again</button>
-        </div>
-        <p class="hint">Read-only. Templates are created and approved in WhatsApp Manager.</p>
-        <div class="table-wrap"><table id="table-templates"></table></div>
+        <header class="page-head"><div><h1>WhatsApp templates</h1><p class="muted">Approval status from Meta. Templates are created in WhatsApp Manager.</p></div>
+          <button id="templates-refresh" class="btn"><svg class="ico"><use href="#i-refresh"/></svg>Check again</button></header>
+        <div class="kpis small" id="template-summary"></div>
+        <div class="table-card"><table id="table-templates"></table></div>
       </section>
 
+      <!-- Broadcast -->
       <section data-panel="broadcast" hidden>
-        <h2>Broadcast to donors</h2>
-        <form id="broadcast-form" class="card form-grid">
-          <label class="wide">Message
-            <textarea name="message" rows="5" maxlength="700" required placeholder="Health tip of the week..."></textarea>
-          </label>
-          <p class="hint wide"><span id="msg-count">0</span>/700 characters. Donors see "Hello &lt;name&gt;, a message from the LifeDrop team:" before it.</p>
-          <label>Send to
-            <select name="audience">
-              <option value="all">All donors</option>
-              <option value="blood_type">One blood type</option>
-              <option value="city">One city</option>
-            </select>
-          </label>
-          <label id="aud-blood" hidden>Blood type <select name="blood_type" class="blood-types-count"></select></label>
-          <label id="aud-city" hidden>City <input name="city" list="city-list" placeholder="Buea"><datalist id="city-list"></datalist></label>
-          <label class="check wide"><input type="checkbox" name="window_only"> Only donors who messaged the bot in the last 24 hours (no template needed)</label>
-          <button type="submit">Preview</button>
-        </form>
-
-        <div id="broadcast-preview" class="card" hidden>
-          <h3>Check before sending</h3>
-          <p id="preview-summary"></p>
-          <p id="preview-warning" class="error"></p>
-          <div class="previews">
-            <div><h4>Donors active in last 24h get</h4><pre id="preview-text"></pre></div>
-            <div><h4>Everyone else gets template <code>donor_broadcast</code></h4><pre id="preview-template"></pre></div>
-          </div>
-          <label class="check"><input type="checkbox" id="confirm-check"> I checked the text and the number of donors</label>
-          <div class="row">
-            <button id="broadcast-send" class="danger" disabled>Send now</button>
-            <button id="broadcast-cancel" class="ghost">Cancel</button>
-          </div>
+        <header class="page-head"><div><h1>Broadcast</h1><p class="muted">Send news or a health tip to donors. You always see a preview first.</p></div></header>
+        <div class="grid broadcast-grid">
+          <form id="broadcast-form" class="panel span-2">
+            <h2>1. Write</h2>
+            <label class="field">Message
+              <textarea name="message" rows="6" maxlength="700" required placeholder="Health tip of the week…"></textarea>
+            </label>
+            <p class="muted small"><span id="msg-count">0</span>/700 · Donors see "Hello &lt;name&gt;, a message from the LifeDrop team:" before it.</p>
+            <h2>2. Choose who gets it</h2>
+            <div class="form-row">
+              <label class="field">Send to
+                <select name="audience"><option value="all">All donors</option><option value="blood_type">One blood type</option><option value="city">One town</option></select>
+              </label>
+              <label class="field" id="aud-blood" hidden>Blood type <select name="blood_type"></select></label>
+              <label class="field" id="aud-city" hidden>Town <input name="city" list="city-list" placeholder="Buea"><datalist id="city-list"></datalist></label>
+            </div>
+            <label class="check"><input type="checkbox" name="window_only"> Only donors who messaged the bot in the last 24 hours (no template needed)</label>
+            <button type="submit" class="btn primary">Preview</button>
+          </form>
+          <aside class="panel phone-panel">
+            <h2>3. Check</h2>
+            <div id="preview-empty" class="muted">Write a message and press Preview.</div>
+            <div id="broadcast-preview" hidden>
+              <div class="preview-count"><strong id="preview-total">0</strong><span>donors</span></div>
+              <p id="preview-summary" class="small"></p>
+              <p id="preview-warning" class="warn" hidden></p>
+              <div class="phone">
+                <div class="bubble" id="preview-text"></div>
+                <div class="bubble-meta">Normal message · donors active in last 24h</div>
+                <div class="bubble template" id="preview-template"></div>
+                <div class="bubble-meta">Template donor_broadcast · everyone else</div>
+              </div>
+              <label class="check"><input type="checkbox" id="confirm-check"> I checked the text and the number of donors</label>
+              <div class="row-end">
+                <button id="broadcast-cancel" class="btn" type="button">Cancel</button>
+                <button id="broadcast-send" class="btn danger" type="button" disabled>Send</button>
+              </div>
+            </div>
+          </aside>
         </div>
-
-        <h3>Past broadcasts</h3>
-        <div class="table-wrap"><table id="table-broadcasts"></table></div>
+        <h2 class="section-title">Past broadcasts</h2>
+        <div class="table-card"><table id="table-broadcasts"></table></div>
         <div id="broadcast-detail" hidden>
-          <h3 id="broadcast-detail-title"></h3>
-          <div class="table-wrap"><table id="table-broadcast-recipients"></table></div>
+          <h2 class="section-title" id="broadcast-detail-title"></h2>
+          <div class="table-card"><table id="table-broadcast-recipients"></table></div>
         </div>
       </section>
     </main>
   </div>
+  <p id="toast" class="toast" hidden></p>
 </body>
 </html>

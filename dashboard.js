@@ -125,6 +125,10 @@ function templateStatusRows(required, metaTemplates) {
   return [...rows, ...extra];
 }
 
+// TIMESTAMP columns hold UTC (Render runs in UTC); charts group by the day in Cameroon
+const localDay = (col) => `((${col}) AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Douala')::date`;
+const LOCAL_TODAY = `(NOW() AT TIME ZONE 'Africa/Douala')::date`;
+
 const intParam = (v, def, max) => Math.min(Math.max(parseInt(v, 10) || def, 0), max);
 const errorText = (err) => String(err.response?.data?.error?.message || err.message || 'error').slice(0, 300);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -137,6 +141,7 @@ function createDashboard({
   wabaId = process.env.WABA_ID,
   whatsappToken = process.env.WHATSAPP_TOKEN,
   delayMs = parseInt(process.env.BROADCAST_DELAY_MS, 10) || 300,
+  allowSend = process.env.BROADCASTS_DISABLED !== 'true', // false in local mode: reading real data, never sending
   templatesFile = path.join(__dirname, 'templates', 'WHATSAPP_TEMPLATES.md')
 }) {
   const router = express.Router();
@@ -176,7 +181,7 @@ function createDashboard({
   router.use(express.json({ limit: '50kb' }));
   router.use((req, res, next) => {
     res.set({
-      'Content-Security-Policy': "default-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'",
+      'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'",
       'X-Frame-Options': 'DENY',
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer',
@@ -185,6 +190,9 @@ function createDashboard({
     next();
   });
   router.use(express.static(path.join(__dirname, 'admin-ui')));
+  // chart.js only exports its CommonJS entry, which sits next to the browser build in dist/
+  const chartJsFile = path.join(path.dirname(require.resolve('chart.js')), 'chart.umd.js');
+  router.get('/vendor/chart.umd.js', (req, res) => res.sendFile(chartJsFile));
 
   const isLoggedIn = (req) => validSessionToken(adminKey, parseCookies(req.headers.cookie)[COOKIE_NAME]);
   const cookie = (req, value, maxAgeSec) => {
@@ -232,12 +240,13 @@ function createDashboard({
     return out;
   }));
 
-  router.get('/api/me', (req, res) => res.json({ ok: true, wabaConfigured: Boolean(wabaId) }));
+  router.get('/api/me', (req, res) => res.json({ ok: true, wabaConfigured: Boolean(wabaId), allowSend }));
 
   // ----- Overview -----
   router.get('/api/stats', api(async (req, res) => {
     const days = intParam(req.query.days, 7, 365) || 7;
-    const [stats, totals] = await Promise.all([
+    const chartDays = Math.max(days, 7);
+    const [stats, totals, series, bloodTypes, openRequests] = await Promise.all([
       getStats(days),
       pool.query(`SELECT
           (SELECT COUNT(*) FROM requests WHERE status IS DISTINCT FROM 'fulfilled') AS requests_open,
@@ -247,9 +256,34 @@ function createDashboard({
           (SELECT COUNT(*) FROM matches) AS matches_total,
           (SELECT COUNT(*) FROM matches WHERE response IS NOT NULL) AS matches_replied,
           (SELECT COUNT(*) FROM matches WHERE donation_confirmed_at IS NOT NULL) AS donations_confirmed,
-          (SELECT COUNT(*) FROM donors WHERE broadcast_opt_out IS TRUE) AS donors_opted_out`)
+          (SELECT COUNT(*) FROM donors WHERE broadcast_opt_out IS TRUE) AS donors_opted_out`),
+      // One row per day in Cameroon time (timestamps are stored in UTC)
+      pool.query(
+        `WITH days AS (
+           SELECT generate_series(${LOCAL_TODAY} - ($1::int - 1), ${LOCAL_TODAY}, INTERVAL '1 day')::date AS day
+         )
+         SELECT to_char(d.day, 'YYYY-MM-DD') AS day,
+           (SELECT COUNT(*) FROM donors WHERE ${localDay('created_at')} = d.day) AS donors,
+           (SELECT COUNT(*) FROM requests WHERE ${localDay('created_at')} = d.day) AS requests,
+           (SELECT COUNT(*) FROM matches WHERE ${localDay('contacted_at')} = d.day) AS contacted,
+           (SELECT COUNT(*) FROM matches WHERE response = 'yes' AND ${localDay('responded_at')} = d.day) AS yes,
+           (SELECT COUNT(*) FROM matches WHERE ${localDay('donation_confirmed_at')} = d.day) AS donations
+         FROM days d ORDER BY d.day`,
+        [chartDays]
+      ),
+      pool.query(`SELECT COALESCE(NULLIF(blood_type, ''), 'UNKNOWN') AS blood_type, COUNT(*) AS count FROM donors GROUP BY 1`),
+      pool.query(
+        `SELECT r.id, r.blood_type_needed, r.units_needed, r.urgency, COALESCE(r.town, r.location) AS location, r.created_at,
+           (SELECT COUNT(*) FROM matches m WHERE m.request_id = r.id) AS contacted,
+           (SELECT COUNT(*) FROM matches m WHERE m.request_id = r.id AND m.response = 'yes') AS yes
+         FROM requests r WHERE r.status IS DISTINCT FROM 'fulfilled'
+         ORDER BY r.created_at DESC NULLS LAST, r.id DESC LIMIT 6`
+      )
     ]);
-    res.json({ days, stats, totals: totals.rows[0], report: formatStatsReport(stats, days) });
+    res.json({
+      days, stats, totals: totals.rows[0], report: formatStatsReport(stats, days),
+      series: series.rows, bloodTypes: bloodTypes.rows, openRequests: openRequests.rows
+    });
   }));
 
   // ----- Lists -----
@@ -503,6 +537,7 @@ function createDashboard({
 
   router.post('/api/broadcasts', api(async (req, res) => {
     const { message, audience = {}, confirm, expected_count: expected } = req.body || {};
+    if (!allowSend) return res.status(403).json({ error: 'Sending is turned off here (local mode). Send broadcasts from the live dashboard on Render.' });
     if (confirm !== true) return res.status(400).json({ error: 'Confirm the broadcast first.' });
     const messageError = checkMessage(message);
     if (messageError) return res.status(400).json({ error: messageError });

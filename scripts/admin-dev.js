@@ -47,39 +47,55 @@ Module._load = function (request, ...rest) {
 
 async function seed() {
   await pool.query(SCHEMA);
-  const hoursAgo = (h) => new Date(Date.now() - h * 3600 * 1000).toISOString();
-  const donors = [
-    ['Jean Mbah', 'O+', 'Buea', 'eligible', 2, 'male'],
-    ['Marie Ngo', 'O+', 'Buea', 'eligible', 80, 'female'],
-    ['Paul Tabi', 'A+', 'Limbe', 'needs_review', 200, 'male', 'Takes regular medication'],
-    ['Grace Eyong', 'B+', 'Tiko', 'eligible', 5, 'female'],
-    ['Samuel Fon', 'O-', 'Douala', 'eligible', 400, 'male'],
-    ['Esther Ndi', 'AB+', 'Buea', 'needs_review', 30, 'female', 'Heavy periods'],
-    ['Eric Nkem', 'A-', 'Limbe', 'not_eligible', 500, 'male', 'Chronic condition'],
-    ['Linda Ayuk', 'O+', 'Douala', 'eligible', 1, 'female'],
-    ['Peter Ewane', 'B-', 'Buea', 'eligible', 90, 'male'],
-    ['Rose Bate', 'A+', 'Tiko', 'on_hold', 300, 'female'],
-    ['Didier Kum', 'O+', 'Limbe', 'eligible', 12, 'male'],
-    ['Fake Failure', 'O+', 'Buea', 'eligible', 100, 'male']
-  ];
-  for (const [i, d] of donors.entries()) {
+  // Deterministic fictional data spread over the last 45 days, so the charts have something to show
+  let x = 7;
+  const rand = () => ((x = (x * 9301 + 49297) % 233280) / 233280);
+  const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+  const first = ['Jean', 'Marie', 'Paul', 'Grace', 'Samuel', 'Esther', 'Eric', 'Linda', 'Peter', 'Rose', 'Didier', 'Brenda', 'Kevin', 'Joy', 'Yannick'];
+  const last = ['Mbah', 'Ngo', 'Tabi', 'Eyong', 'Fon', 'Ndi', 'Nkem', 'Ayuk', 'Ewane', 'Bate', 'Kum', 'Tanyi'];
+  const towns = ['Buea', 'Buea', 'Buea', 'Limbe', 'Limbe', 'Tiko', 'Douala', 'Douala', 'Mutengene', 'Kumba'];
+  const types = ['O+', 'O+', 'O+', 'O+', 'A+', 'A+', 'B+', 'B+', 'AB+', 'O-', 'A-', 'B-', 'AB-'];
+  const statuses = ['eligible', 'eligible', 'eligible', 'eligible', 'eligible', 'eligible', 'needs_review', 'not_eligible', 'on_hold'];
+  for (let i = 0; i < 64; i++) {
+    const daysAgo = Math.floor(rand() * rand() * 45); // more sign-ups recently
+    const status = i === 63 ? 'eligible' : pick(statuses);
+    const donated = rand() < 0.15 ? `NOW() - INTERVAL '${Math.floor(rand() * 60)} days'` : 'NULL';
     await pool.query(
-      `INSERT INTO donors (name, phone, blood_type, city, town, eligibility_status, last_inbound_at, gender, screening_reasons, created_at)
-       VALUES ($1, $2, $3, lower($4), $4, $5, $6, $7, $8, $9)`,
-      [d[0], `2376000000${String(i + 2).padStart(2, '0')}`, d[1], d[2], d[3], hoursAgo(d[4]), d[5], d[6] || null, hoursAgo(24 * (i + 1))]
+      `INSERT INTO donors (name, phone, blood_type, city, town, eligibility_status, last_inbound_at, gender, screening_reasons, created_at, last_donation_date)
+       VALUES ($1, $2, $3, lower($4), $4, $5, NOW() - $6 * INTERVAL '1 hour', $7, $8, NOW() - $9 * INTERVAL '1 day' - $10 * INTERVAL '1 hour', ${donated})`,
+      [i === 63 ? 'Fake Failure' : `${pick(first)} ${pick(last)}`, `2376000${String(i + 100).padStart(5, '0')}`, pick(types), pick(towns), status,
+       Math.floor(rand() * 300), rand() < 0.5 ? 'male' : 'female', status === 'needs_review' ? pick(['Takes regular medication', 'Heavy periods', 'Recent surgery']) : null,
+       daysAgo, Math.floor(rand() * 20)]
     );
   }
-  await pool.query(`INSERT INTO facilities (name, type, city, staff_phone, is_partner, does_blood_collection) VALUES
-    ('Dev Regional Hospital (fictional)', 'hospital', 'Buea', '237600000090', TRUE, TRUE)`);
-  await pool.query(`INSERT INTO requests (requester_phone, blood_type_needed, location, town, urgency, status, units_needed, facility_id, created_at, fulfilled_at) VALUES
-    ('237600000080', 'O+', 'buea', 'Buea', 'Emergency', 'fulfilled', 2, 1, NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days' + INTERVAL '40 minutes'),
-    ('237600000081', 'A+', 'limbe', 'Limbe', 'Urgent', 'open', 1, NULL, NOW() - INTERVAL '1 day', NULL),
-    ('237600000082', 'AB-', 'kumba', NULL, 'Routine', 'open', 1, NULL, NOW() - INTERVAL '2 hours', NULL)`);
-  await pool.query(`INSERT INTO matches (request_id, donor_id, contacted_at, response, responded_at, confirm_code, donation_confirmed_at, confirmed_by_facility_id) VALUES
-    (1, 1, NOW() - INTERVAL '3 days', 'yes', NOW() - INTERVAL '3 days' + INTERVAL '10 minutes', 'LD-12345', NOW() - INTERVAL '2 days', 1),
-    (1, 2, NOW() - INTERVAL '3 days', 'yes', NOW() - INTERVAL '3 days' + INTERVAL '30 minutes', 'LD-23456', NULL, NULL),
-    (1, 8, NOW() - INTERVAL '3 days', 'no', NOW() - INTERVAL '3 days' + INTERVAL '5 minutes', NULL, NULL, NULL),
-    (2, 3, NOW() - INTERVAL '1 day', NULL, NULL, NULL, NULL, NULL)`);
+  await pool.query(`UPDATE donors SET phone = '237600000013' WHERE name = 'Fake Failure'`);
+  await pool.query(`INSERT INTO facilities (name, type, city, staff_phone, is_partner, does_blood_collection, does_lab_tests) VALUES
+    ('Dev Regional Hospital (fictional)', 'hospital', 'Buea', '237600000090', TRUE, TRUE, FALSE),
+    ('Dev Lab Limbe (fictional)', 'lab', 'Limbe', '237600000091', TRUE, FALSE, TRUE)`);
+  for (let r = 1; r <= 26; r++) {
+    const daysAgo = Math.floor(rand() * 40);
+    const fulfilled = rand() < 0.6 && daysAgo > 0;
+    const type = pick(types);
+    await pool.query(
+      `INSERT INTO requests (requester_phone, blood_type_needed, location, town, urgency, status, units_needed, facility_id, created_at, fulfilled_at)
+       VALUES ($1, $2, lower($3), $3, $4, $5, $6, $7, NOW() - $8 * INTERVAL '1 day', ${fulfilled ? `NOW() - $8 * INTERVAL '1 day' + INTERVAL '50 minutes'` : 'NULL'})`,
+      [`2376000800${String(r).padStart(2, '0')}`, type, pick(towns), pick(['Emergency', 'Urgent', 'Urgent', 'Routine']), fulfilled ? 'fulfilled' : 'open',
+       1 + Math.floor(rand() * 3), rand() < 0.4 ? 1 : null, daysAgo]
+    );
+    if (rand() < 0.15) continue; // some requests found no donor
+    const contacts = 2 + Math.floor(rand() * 4);
+    for (let c = 0; c < contacts; c++) {
+      const donorId = 1 + Math.floor(rand() * 63);
+      const reply = pick(['yes', 'yes', 'no', null, null, 'not_needed']);
+      const confirmed = reply === 'yes' && rand() < 0.5;
+      await pool.query(
+        `INSERT INTO matches (request_id, donor_id, contacted_at, response, responded_at, confirm_code, donation_confirmed_at, confirmed_by_facility_id)
+         VALUES ($1, $2, NOW() - $3 * INTERVAL '1 day', $4, ${reply ? `NOW() - $3 * INTERVAL '1 day' + INTERVAL '25 minutes'` : 'NULL'},
+           $5, ${confirmed ? `NOW() - $3 * INTERVAL '1 day' + INTERVAL '1 day'` : 'NULL'}, $6)`,
+        [r, donorId, daysAgo, reply, reply === 'yes' ? `LD-${10000 + r * 10 + c}` : null, confirmed && rand() < 0.6 ? 1 : null]
+      );
+    }
+  }
 }
 
 seed().then(() => {

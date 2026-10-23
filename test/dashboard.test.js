@@ -82,7 +82,7 @@ test('STOP and START replies are recognised', () => {
 
 // ---------- HTTP + database (PGlite, no real WhatsApp) ----------
 
-async function setup({ sendFails = [] } = {}) {
+async function setup({ sendFails = [], allowSend = true } = {}) {
   const pool = await createTestPool();
   const now = Date.now();
   const recent = new Date(now - HOUR).toISOString();
@@ -108,7 +108,7 @@ async function setup({ sendFails = [] } = {}) {
     donors: { total: '4', new: '4', ready: '3', needs_review: '1' }, requests: {}, matches: {},
     donations: {}, facilities: {}, waitlist: {}, activity: {}, days
   });
-  const dashboard = createDashboard({ pool, getStats, sendMessage, sendTemplate, adminKey: KEY, wabaId: 'WABA', whatsappToken: 'T', delayMs: 0 });
+  const dashboard = createDashboard({ pool, getStats, sendMessage, sendTemplate, adminKey: KEY, wabaId: 'WABA', whatsappToken: 'T', delayMs: 0, allowSend });
   await dashboard.schemaReady;
   const app = express();
   app.use('/admin', dashboard.router);
@@ -147,9 +147,16 @@ test('everything under /admin/api is 403 until logged in with ADMIN_KEY', async 
     assert.strictEqual(stats.status, 200);
     assert.strictEqual(stats.body.totals.requests_total, '0');
     assert.strictEqual(stats.body.report.length, 3);
+    assert.strictEqual(stats.body.series.length, 7); // one row per day for the charts
+    assert.strictEqual(stats.body.series.reduce((sum, d) => sum + Number(d.donors), 0), 4); // the 4 donors joined today
+    assert.strictEqual(stats.body.bloodTypes.find(b => b.blood_type === 'O+').count, '2');
+    assert.strictEqual(stats.body.openRequests.length, 0);
     const page = await t.call('GET', '/'); // the page itself loads (it shows the login form)
     assert.strictEqual(page.status, 200);
-    assert.match(page.body, /LifeDrop Admin/);
+    assert.match(page.body, /LifeDrop Control/);
+    const chartLib = await t.call('GET', '/vendor/chart.umd.js'); // charts are served from node_modules, no CDN
+    assert.strictEqual(chartLib.status, 200);
+    assert.match(chartLib.headers.get('content-type'), /javascript/);
   } finally { await t.close(); }
 });
 
@@ -274,5 +281,17 @@ test('STOP opts a donor out of broadcasts, START opts back in', async () => {
     r = await t.pool.query(`SELECT broadcast_opt_out FROM donors WHERE phone = '237600000001'`);
     assert.strictEqual(r.rows[0].broadcast_opt_out, false);
     assert.strictEqual(t.sent.length, 2);
+  } finally { await t.close(); }
+});
+
+test('local mode (real database on a laptop) refuses to send broadcasts', async () => {
+  const t = await setup({ allowSend: false });
+  try {
+    await t.login();
+    assert.strictEqual((await t.call('GET', '/api/me')).body.allowSend, false);
+    const r = await t.call('POST', '/api/broadcasts', { message: 'Hi', audience: { type: 'all' }, confirm: true, expected_count: 4 });
+    assert.strictEqual(r.status, 403);
+    assert.match(r.body.error, /turned off/);
+    assert.strictEqual(t.sent.length, 0);
   } finally { await t.close(); }
 });

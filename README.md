@@ -30,12 +30,30 @@ Logging in sets an HttpOnly cookie for 12 hours. Changing `ADMIN_KEY` logs every
 - Donors who reply **STOP** (or tap "Stop updates") are never sent broadcasts again. **START** turns them back on.
   Urgent blood requests still reach them.
 
-### Try it locally (no real database, no real WhatsApp)
+### Open it on your laptop with the REAL data
+
+1. Copy your `DATABASE_URL` (Neon → Connection string, or Render → Environment).
+2. Create a file called `.env` in this folder and paste one line: `DATABASE_URL=postgres://...`
+   (`.env` is git-ignored, so it is never committed.)
+3. Run:
+
+```bash
+npm install
+npm run admin:local
+```
+
+4. Open http://localhost:3100/admin and log in with `local-admin-key` (or your `ADMIN_KEY` if it is in `.env`).
+
+In local mode WhatsApp sending is blocked and broadcasts are turned off, and the appointment reminder timer does not run.
+Approving donors and editing hospitals **do** change the real database. On first start it also adds the
+dashboard tables (`broadcasts`, `broadcast_recipients`) and columns, exactly as the Render deploy would.
+
+### Try it with fake data (no database, no WhatsApp)
 
 ```bash
 npm install
 npm run dev:admin
 ```
 
-Open http://localhost:3100/admin and log in with `dev-admin-key`. It uses an in-memory database with
-fictional donors, and prints WhatsApp messages instead of sending them.
+Open http://localhost:3100/admin and log in with `dev-admin-key`. It uses an in-memory
+database with fictional donors, and prints WhatsApp messages instead of sending them.
