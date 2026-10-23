@@ -258,7 +258,7 @@ async function handleMessage(from, text) {
         const restLine = daysLeft > 0
           ? `\n\nThank you for your last donation! ❤️ You're on a rest break. You can donate again in ${daysLeft} day(s). We won't send you requests until then.`
           : '';
-        return sendMessage(from, `Welcome back, ${existing.rows[0].name}! 🩸${restLine}\n\nReply:\n1 - Update my donor info\n2 - Request blood\n3 - Book a free blood test\n\n📍 Tip: send your location pin any time so we match you with patients nearby.`);
+        return sendMessage(from, `Welcome back, ${existing.rows[0].name}! 🩸${restLine}\n\nReply:\n1 - Update my donor info\n2 - Request blood\n4 - Book a free blood test\n\n📍 Tip: send your location pin any time so we match you with patients nearby.`);
       }
       return sendMessage(from, "Welcome to LifeDrop 🩸\n\nReply:\n1 - Register as a blood donor\n2 - Request blood");
     }
@@ -270,7 +270,7 @@ async function handleMessage(from, text) {
       } else if (text === '2') {
         session.step = 'request_blood_type';
         return sendMessage(from, "What blood type is needed? (e.g. A+, O-, B+, AB+)");
-      } else if (text === '3') {
+      } else if (text === '4') {
         return offerLabs(from);
       } else {
         session.aiAttempts = (session.aiAttempts || 0) + 1;
