@@ -300,3 +300,28 @@ td > div > .cell-sub, td > div > .cell-main { white-space: nowrap; }
 #table-donors th:last-child, #table-donors td:last-child { position: sticky; right: 0; background: var(--surface); box-shadow: -2px 0 0 var(--border); }
 #table-donors tbody tr:hover td:last-child { background: var(--surface-2); }
 #table-donors td:last-child:empty, #table-donors th:last-child:empty { box-shadow: none; }
+
+/* Donor profile drawer */
+.drawer { margin: 0 0 0 auto; height: 100vh; max-height: 100vh; width: min(520px, 100%); border: 0; border-left: 2px solid var(--border);
+  padding: 0; background: var(--bg); color: var(--text); overflow-y: auto; }
+.drawer::backdrop { background: rgba(26, 18, 16, .45); }
+.drawer-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 18px 22px; background: var(--surface); border-bottom: 2px solid var(--border); }
+.drawer-head .who { display: flex; align-items: center; gap: 12px; }
+.drawer-head h2 { margin: 0; font-size: 22px; }
+#drawer-body { padding: 20px 22px 40px; display: flex; flex-direction: column; gap: 16px; }
+.facts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.fact { background: var(--surface); border: 2px solid var(--border); border-radius: 14px; padding: 10px 12px; }
+.fact span { display: block; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.fact b { font-weight: 800; font-size: 14px; }
+.timeline { display: flex; flex-direction: column; gap: 8px; }
+.tl-item { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; background: var(--surface); border: 2px solid var(--border); border-radius: 14px; padding: 10px 12px; }
+.tl-item .cell-sub { white-space: normal; }
+.drawer-actions { display: flex; gap: 10px; }
+.drawer-actions .btn { flex: 1; }
+.name-link { background: none; border: 0; padding: 0; font: inherit; color: inherit; cursor: pointer; text-align: left; }
+.name-link .cell-main { text-decoration: underline; text-decoration-color: var(--border-strong); text-underline-offset: 3px; }
+.name-link:hover .cell-main { color: var(--accent); text-decoration-color: var(--accent); }
+#table-requests th:last-child, #table-requests td:last-child { position: sticky; right: 0; background: var(--surface); box-shadow: -2px 0 0 var(--border); }
+#table-requests tbody tr:hover td:last-child { background: var(--surface-2); }
+.name-link .cell-main, .name-link .cell-sub { white-space: nowrap; }

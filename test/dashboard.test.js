@@ -5,7 +5,7 @@ const path = require('path');
 const express = require('express');
 const axios = require('axios');
 const {
-  createDashboard, maskPhone, sessionToken, validSessionToken, parseCookies, broadcastPayload,
+  createDashboard, toCsv, maskPhone, sessionToken, validSessionToken, parseCookies, broadcastPayload,
   audienceFilter, requiredTemplates, templateStatusRows, isStopText, isStartText, STOP_PAYLOAD
 } = require('../dashboard');
 const { createTestPool } = require('./helpers/pglite-pool');
@@ -293,5 +293,73 @@ test('local mode (real database on a laptop) refuses to send broadcasts', async 
     assert.strictEqual(r.status, 403);
     assert.match(r.body.error, /turned off/);
     assert.strictEqual(t.sent.length, 0);
+  } finally { await t.close(); }
+});
+
+test('CSV cells are quoted and formula-safe', () => {
+  const csv = toCsv([{ a: 'x,y', b: '=HYPERLINK("bad")', c: null }, { a: 'say "hi"', b: 5, c: '-2' }], ['a', 'b', 'c']);
+  assert.strictEqual(csv, 'a,b,c\r\n"x,y","\'=HYPERLINK(""bad"")",\r\n"say ""hi""",5,\'-2\r\n');
+});
+
+test('requests can be marked fulfilled, closed and reopened, and every change is logged', async () => {
+  const t = await setup();
+  try {
+    await t.login();
+    await t.pool.query(`INSERT INTO requests (requester_phone, blood_type_needed, location, urgency) VALUES ('237600000050', 'O+', 'buea', 'Urgent')`);
+    let r = await t.call('POST', '/api/requests/1/status', { status: 'fulfilled' });
+    assert.strictEqual(r.body.request.status, 'fulfilled');
+    assert.ok(r.body.request.fulfilled_at);
+    r = await t.call('POST', '/api/requests/1/status', { status: 'open' });
+    assert.strictEqual(r.body.request.fulfilled_at, null);
+    r = await t.call('POST', '/api/requests/1/status', { status: 'closed' });
+    assert.strictEqual(r.body.request.status, 'closed');
+    assert.strictEqual((await t.call('POST', '/api/requests/1/status', { status: 'deleted' })).status, 400);
+    assert.strictEqual((await t.call('POST', '/api/requests/99/status', { status: 'closed' })).status, 404);
+
+    const stats = await t.call('GET', '/api/stats?days=7');
+    assert.strictEqual(stats.body.totals.requests_open, '0'); // closed is not open
+    assert.strictEqual(stats.body.totals.requests_closed, '1');
+    assert.strictEqual((await t.call('GET', '/api/requests?status=closed')).body.rows.length, 1);
+
+    const donors = (await t.call('GET', '/api/donors?status=needs_review')).body.rows;
+    await t.call('POST', `/api/donors/${donors[0].id}/review`, { decision: 'approve' });
+    const log = (await t.call('GET', '/api/log')).body.rows;
+    assert.deepStrictEqual(log.map(l => l.action), ['donor_approved', 'request_closed', 'request_open', 'request_fulfilled']);
+    assert.strictEqual(log[0].target_name, 'Paul Review');
+  } finally { await t.close(); }
+});
+
+test('donor profile shows history, and phones stay masked', async () => {
+  const t = await setup();
+  try {
+    await t.login();
+    await t.pool.query(`INSERT INTO requests (requester_phone, blood_type_needed, location, urgency) VALUES ('237600000050', 'O+', 'buea', 'Urgent')`);
+    await t.pool.query(`INSERT INTO matches (request_id, donor_id, response, donation_confirmed_at, confirm_code) VALUES (1, 1, 'yes', NOW(), 'LD-11111'), (1, 2, NULL, NULL, NULL)`);
+    const p = await t.call('GET', '/api/donors/1');
+    assert.strictEqual(p.status, 200);
+    assert.strictEqual(p.body.donor.name, 'Jean Recent');
+    assert.ok(p.body.donor.phone.includes('•'));
+    assert.strictEqual(p.body.matches.length, 1);
+    assert.strictEqual(p.body.matches[0].confirm_code, 'LD-11111');
+    assert.strictEqual((await t.call('GET', '/api/donors/1?reveal=1')).body.donor.phone, '237600000001');
+    assert.strictEqual((await t.call('GET', '/api/donors/999')).status, 404);
+    assert.strictEqual((await t.call('GET', '/api/matches?donor_id=2')).body.rows.length, 1);
+  } finally { await t.close(); }
+});
+
+test('CSV export uses the list filters and masks phones unless revealed', async () => {
+  const t = await setup();
+  try {
+    await t.login();
+    const masked = await t.call('GET', '/api/export/donors.csv?blood_type=O%2B');
+    assert.strictEqual(masked.status, 200);
+    assert.match(masked.headers.get('content-disposition'), /attachment; filename="lifedrop-donors-\d{4}-\d{2}-\d{2}\.csv"/);
+    const lines = masked.body.replace(/^﻿/, '').trim().split('\r\n');
+    assert.strictEqual(lines[0].split(',')[0], 'id');
+    assert.strictEqual(lines.length, 3); // header + 2 O+ donors
+    assert.ok(!masked.body.includes('237600000001'));
+    const revealed = await t.call('GET', '/api/export/donors.csv?reveal=1');
+    assert.ok(revealed.body.includes('237600000001'));
+    assert.strictEqual((await t.call('GET', '/api/export/secrets.csv')).status, 404);
   } finally { await t.close(); }
 });

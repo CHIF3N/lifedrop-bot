@@ -188,7 +188,8 @@ function loadTab(tab) {
     matches: () => loadList('matches'),
     facilities: () => loadList('facilities'),
     templates: () => loadTemplates(false),
-    broadcast: loadBroadcastTab
+    broadcast: loadBroadcastTab,
+    log: loadLog
   };
   loaders[tab]().catch(err => toast(err.message, true));
 }
@@ -475,7 +476,7 @@ const switchCell = (r, flag) => el('label', { class: 'switch' },
 
 const COLUMNS = {
   donors: [
-    ['Donor', r => stack(r.name || 'No name', `#${r.id} · joined ${fmtDay(r.created_at)}`)],
+    ['Donor', r => el('button', { class: 'name-link', onclick: () => openDonor(r.id) }, stack(r.name || 'No name', `#${r.id} · joined ${fmtDay(r.created_at)}`))],
     ['Phone', r => el('span', { class: 'mono' }, r.phone)],
     ['Blood', r => blood(r.blood_type)],
     ['Town', r => r.city],
@@ -494,15 +495,20 @@ const COLUMNS = {
     ['Blood', r => blood(r.blood_type_needed)],
     ['Units', r => r.units_needed],
     ['Urgency', r => badge(r.urgency || '–', URGENCY[r.urgency] || '')],
-    ['Status', r => badge(r.status === 'fulfilled' ? 'Fulfilled' : 'Open', r.status === 'fulfilled' ? 'ok' : 'warn')],
+    ['Status', r => { const [t, tone] = REQUEST_STATUS[r.status] || [r.status, '']; return badge(t, tone); }],
     ['Place', r => stack(r.location, r.facility_name || r.hospital_name)],
-    ['Donors', r => `${r.contacted} contacted · ${r.yes} yes`],
+    ['Donors', r => el('button', { class: 'link', onclick: () => showMatchesFor('request_id', r.id) }, `${r.contacted} contacted · ${r.yes} yes`)],
     ['Requester', r => el('span', { class: 'mono' }, r.requester_phone)],
-    ['Contact', r => stack(r.contact_name, r.contact_phone)]
+    ['Contact', r => stack(r.contact_name, r.contact_phone)],
+    ['Actions', r => (r.status === 'open'
+      ? el('span', { class: 'actions' },
+        el('button', { class: 'btn sm ok-outline', onclick: () => setRequestStatus(r, 'fulfilled') }, 'Fulfilled'),
+        el('button', { class: 'btn sm', onclick: () => setRequestStatus(r, 'closed') }, 'Close'))
+      : el('button', { class: 'btn sm', onclick: () => setRequestStatus(r, 'open') }, 'Reopen'))]
   ],
   matches: [
     ['Match', r => stack(`#${r.id}`, `request #${r.request_id}`)],
-    ['Donor', r => stack(r.donor_name, r.phone)],
+    ['Donor', r => el('button', { class: 'name-link', onclick: () => openDonor(r.donor_id) }, stack(r.donor_name || `#${r.donor_id}`, r.phone))],
     ['Blood', r => blood(r.blood_type_needed)],
     ['Place', r => r.location],
     ['Reply', r => { const [t, tone] = REPLY[r.response] || [r.response, '']; return badge(t, tone); }],
@@ -521,6 +527,122 @@ const COLUMNS = {
     ['Added', r => fmtDay(r.created_at)]
   ]
 };
+
+const REQUEST_STATUS = { open: ['Open', 'warn'], fulfilled: ['Fulfilled', 'ok'], closed: ['Closed', ''] };
+
+async function setRequestStatus(r, status) {
+  const text = {
+    fulfilled: ['Mark as fulfilled?', 'Use this when the patient got the blood they needed.', 'Mark fulfilled', 'success'],
+    closed: ['Close this request?', 'Use this when blood is no longer needed (cancelled, duplicate or a test).', 'Close request', 'danger'],
+    open: ['Reopen this request?', 'It will show as open again on the overview.', 'Reopen', 'primary']
+  }[status];
+  const yes = await askConfirm({ title: `Request #${r.id}: ${text[0]}`, text: text[1], confirmLabel: text[2], tone: text[3] });
+  if (!yes) return;
+  try {
+    await api(`/admin/api/requests/${r.id}/status`, { method: 'POST', body: { status } });
+    toast(`Request #${r.id} is now ${REQUEST_STATUS[status][0].toLowerCase()}.`);
+    loadList('requests');
+  } catch (err) { toast(err.message, true); }
+}
+
+function showMatchesFor(field, id) {
+  const form = document.querySelector('form[data-list="matches"]');
+  form.reset();
+  form.elements[field].value = id;
+  openTab('matches');
+}
+
+// CSV download with the current filters
+$$('[data-export]').forEach(b => b.addEventListener('click', () => {
+  window.location.href = `/admin/api/export/${b.dataset.export}.csv?${filterQuery(b.dataset.export)}`;
+}));
+
+// ---------- Donor profile ----------
+$('#drawer-close').addEventListener('click', () => $('#donor-drawer').close());
+$('#donor-drawer').addEventListener('click', (e) => { if (e.target === $('#donor-drawer')) $('#donor-drawer').close(); }); // click outside
+
+async function openDonor(id) {
+  if (!id) return;
+  let data;
+  try {
+    data = await api(`/admin/api/donors/${id}${reveal() ? '?reveal=1' : ''}`);
+  } catch (err) { toast(err.message, true); return; }
+  const { donor: d, matches, appointments, broadcastsReceived } = data;
+  const [statusText, statusTone] = DONOR_STATUS[d.eligibility_status] || [d.eligibility_status || '–', ''];
+  $('#drawer-title').replaceChildren(el('div', { class: 'who' }, blood(d.blood_type || '?'),
+    el('div', {}, el('h2', {}, d.name || 'No name'), el('div', { class: 'cell-sub' }, `Donor #${d.id} · ${d.phone}`))));
+  const fact = (label, value) => el('div', { class: 'fact' }, el('span', {}, label), el('b', {}, value || '–'));
+  const donated = matches.filter(m => m.donation_confirmed_at).length;
+  const body = [
+    el('div', {}, badge(statusText, statusTone), ' ', d.broadcast_opt_out ? badge('No news (STOP)', '') : ''),
+    d.screening_reasons ? el('p', { class: 'warn' }, `Screening notes: ${d.screening_reasons}`) : null,
+    d.eligibility_status === 'needs_review' ? el('div', { class: 'drawer-actions' },
+      el('button', { class: 'btn success', onclick: async () => { await reviewDonor(d.id, 'approve', d.name); openDonor(d.id); } }, 'Approve'),
+      el('button', { class: 'btn danger', onclick: async () => { await reviewDonor(d.id, 'reject', d.name); openDonor(d.id); } }, 'Reject')) : null,
+    el('div', { class: 'facts' },
+      fact('Town', d.place),
+      fact('Gender / age', [d.gender, d.age].filter(Boolean).join(' · ')),
+      fact('Joined', fmtDay(d.created_at)),
+      fact('Last message', ago(d.last_inbound_at)),
+      fact('Last donation', fmtDay(d.last_donation_date)),
+      fact('Can give again', d.deferred_until ? fmtDay(d.deferred_until) : 'Now / unknown'),
+      fact('Verified', d.verified_at ? `${fmtDay(d.verified_at)}${d.verified_by ? ` · ${d.verified_by}` : ''}` : 'No'),
+      fact('Location pin', d.has_pin ? 'Shared' : 'Not shared'),
+      fact('Times contacted', String(matches.length)),
+      fact('Confirmed donations', String(donated)),
+      fact('Said yes', String(matches.filter(m => m.response === 'yes').length)),
+      fact('Broadcasts received', String(broadcastsReceived))),
+    el('h2', {}, 'Request history'),
+    el('div', { class: 'timeline' }, matches.length ? matches.map(m => {
+      const [t, tone] = REPLY[m.response] || [m.response, ''];
+      return el('div', { class: 'tl-item' }, blood(m.blood_type_needed),
+        el('div', {}, el('div', { class: 'cell-main' }, `Request #${m.request_id} · ${m.location || ''}`),
+          el('div', { class: 'cell-sub' }, `${fmtDate(m.contacted_at)}${m.donation_confirmed_at ? ` · donated ${fmtDay(m.donation_confirmed_at)}` : ''}${m.confirm_code ? ` · ${m.confirm_code}` : ''}`)),
+        badge(m.donation_confirmed_at ? 'Donated' : t, m.donation_confirmed_at ? 'ok' : tone));
+    }) : el('p', { class: 'empty-note' }, 'Not contacted for any request yet.')),
+    appointments.length ? el('h2', {}, 'Lab bookings') : null,
+    appointments.length ? el('div', { class: 'timeline' }, appointments.map(a => el('div', { class: 'tl-item' }, el('span'),
+      el('div', {}, el('div', { class: 'cell-main' }, a.facility_name), el('div', { class: 'cell-sub' }, fmtDate(a.slot_at))), badge(a.status, a.status === 'booked' ? 'info' : '')))) : null
+  ];
+  $('#drawer-body').replaceChildren(...body.filter(Boolean));
+  if (!$('#donor-drawer').open) $('#donor-drawer').showModal();
+}
+
+// ---------- Activity log ----------
+const ACTION_TEXT = {
+  donor_approved: ['Donor approved', 'ok'], donor_rejected: ['Donor rejected', 'danger'],
+  facility_added: ['Hospital/lab added', 'info'], facility_updated: ['Hospital/lab changed', 'info'],
+  request_fulfilled: ['Request fulfilled', 'ok'], request_closed: ['Request closed', ''], request_open: ['Request reopened', 'warn'],
+  broadcast_sent: ['Broadcast sent', 'warn']
+};
+
+function describeLog(r) {
+  const det = r.details || {};
+  if (r.target_type === 'donor') return el('button', { class: 'link', onclick: () => openDonor(r.target_id) }, `${r.target_name || 'Donor'} (#${r.target_id})`);
+  if (r.target_type === 'facility') {
+    const flags = Object.entries(det).filter(([k]) => k.startsWith('is_') || k.startsWith('does_')).map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v ? 'on' : 'off'}`);
+    return `${r.target_name || 'Facility'} (#${r.target_id})${flags.length ? ` · ${flags.join(', ')}` : det.city ? ` · ${det.city}` : ''}`;
+  }
+  if (r.target_type === 'request') return `Request #${r.target_id}`;
+  if (r.target_type === 'broadcast') return `Broadcast #${r.target_id} · ${det.audience || ''} · ${det.total || 0} donor(s)`;
+  return '';
+}
+
+async function loadLog() {
+  const { rows } = await api('/admin/api/log');
+  renderTable($('#table-log'), rows, [
+    ['When', r => stack(ago(r.created_at), fmtDate(r.created_at))],
+    ['What', r => { const [t, tone] = ACTION_TEXT[r.action] || [r.action, '']; return badge(t, tone); }],
+    ['Details', r => describeLog(r)]
+  ], 'Nothing changed from the dashboard yet.');
+}
+
+// Overview refreshes itself every minute while it is on screen
+setInterval(() => {
+  if (currentTab === 'overview' && !$('#app').hidden && document.visibilityState === 'visible' && !$('#confirm-dialog').open) {
+    loadStats().catch(() => {});
+  }
+}, 60000);
 
 async function loadList(list) {
   const { rows } = await api(`/admin/api/${list}?${filterQuery(list)}`);

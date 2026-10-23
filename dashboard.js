@@ -129,6 +129,18 @@ function templateStatusRows(required, metaTemplates) {
 const localDay = (col) => `((${col}) AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Douala')::date`;
 const LOCAL_TODAY = `(NOW() AT TIME ZONE 'Africa/Douala')::date`;
 
+// Spreadsheet-safe CSV. Cells starting with = + - @ are prefixed so Excel never runs them as formulas.
+function toCsv(rows, columns) {
+  const cell = (v) => {
+    let t = v == null ? '' : v instanceof Date ? v.toISOString() : String(v);
+    if (/^[=+\-@\t\r]/.test(t)) t = `'${t}`;
+    return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  return [columns.join(','), ...rows.map(r => columns.map(c => cell(r[c])).join(','))].join('\r\n') + '\r\n';
+}
+
+const REQUEST_STATUSES = ['open', 'fulfilled', 'closed']; // closed = no longer needed (cancelled, duplicate, test)
+
 const intParam = (v, def, max) => Math.min(Math.max(parseInt(v, 10) || def, 0), max);
 const errorText = (err) => String(err.response?.data?.error?.message || err.message || 'error').slice(0, 300);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -173,6 +185,14 @@ function createDashboard({
       sent_at TIMESTAMP DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS broadcast_recipients_bid_idx ON broadcast_recipients (broadcast_id);
+    CREATE TABLE IF NOT EXISTS admin_log (
+      id SERIAL PRIMARY KEY,
+      action TEXT NOT NULL,
+      target_type TEXT,
+      target_id INTEGER,
+      details JSONB,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
     ALTER TABLE donors ADD COLUMN IF NOT EXISTS broadcast_opt_out BOOLEAN DEFAULT FALSE;
     ALTER TABLE donors ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP;
     UPDATE broadcasts SET status = 'interrupted', finished_at = NOW() WHERE status = 'sending';
@@ -240,6 +260,12 @@ function createDashboard({
     return out;
   }));
 
+  // Every change made from the dashboard is written to admin_log (shown on the Activity page)
+  const logAction = (action, targetType, targetId, details = {}) => pool.query(
+    `INSERT INTO admin_log (action, target_type, target_id, details) VALUES ($1, $2, $3, $4)`,
+    [action, targetType, targetId, JSON.stringify(details)]
+  ).catch(err => console.warn('Admin log error:', err.message));
+
   router.get('/api/me', (req, res) => res.json({ ok: true, wabaConfigured: Boolean(wabaId), allowSend }));
 
   // ----- Overview -----
@@ -249,7 +275,8 @@ function createDashboard({
     const [stats, totals, series, bloodTypes, openRequests] = await Promise.all([
       getStats(days),
       pool.query(`SELECT
-          (SELECT COUNT(*) FROM requests WHERE status IS DISTINCT FROM 'fulfilled') AS requests_open,
+          (SELECT COUNT(*) FROM requests WHERE COALESCE(status, 'open') NOT IN ('fulfilled', 'closed')) AS requests_open,
+          (SELECT COUNT(*) FROM requests WHERE status = 'closed') AS requests_closed,
           (SELECT COUNT(*) FROM requests WHERE status = 'fulfilled') AS requests_fulfilled,
           (SELECT COUNT(*) FROM requests r WHERE NOT EXISTS (SELECT 1 FROM matches m WHERE m.request_id = r.id)) AS requests_no_donor,
           (SELECT COUNT(*) FROM requests) AS requests_total,
@@ -276,7 +303,7 @@ function createDashboard({
         `SELECT r.id, r.blood_type_needed, r.units_needed, r.urgency, COALESCE(r.town, r.location) AS location, r.created_at,
            (SELECT COUNT(*) FROM matches m WHERE m.request_id = r.id) AS contacted,
            (SELECT COUNT(*) FROM matches m WHERE m.request_id = r.id AND m.response = 'yes') AS yes
-         FROM requests r WHERE r.status IS DISTINCT FROM 'fulfilled'
+         FROM requests r WHERE COALESCE(r.status, 'open') NOT IN ('fulfilled', 'closed')
          ORDER BY r.created_at DESC NULLS LAST, r.id DESC LIMIT 6`
       )
     ]);
@@ -301,70 +328,149 @@ function createDashboard({
     return { where: where.length ? `WHERE ${where.join(' AND ')}` : '', params, tail: `LIMIT ${limit} OFFSET ${offset}` };
   }
 
-  router.get('/api/donors', api(async (req, res) => {
-    const q = listQuery(req, {
-      status: `d.eligibility_status = $?`,
-      blood_type: `d.blood_type = $?`,
-      city: `lower(COALESCE(d.town, trim(d.city))) = lower($?)`,
-      q: `(d.name ILIKE $? OR d.phone LIKE $?)`
-    });
-    const result = await pool.query(
-      `SELECT d.id, d.name, d.phone, d.blood_type, COALESCE(d.town, d.city) AS city, d.gender, d.age, d.eligibility_status,
-         d.screening_reasons, d.last_donation_date, d.deferred_until, d.verified_at, d.created_at, d.last_inbound_at,
-         d.broadcast_opt_out, d.reviewed_at
-       FROM donors d ${q.where} ORDER BY d.created_at DESC NULLS LAST, d.id DESC ${q.tail}`,
-      q.params
-    );
-    res.json({ rows: showPhones(req, result.rows) });
+  const LISTS = {
+    donors: {
+      filters: {
+        status: `d.eligibility_status = $?`,
+        blood_type: `d.blood_type = $?`,
+        city: `lower(COALESCE(d.town, trim(d.city))) = lower($?)`,
+        q: `(d.name ILIKE $? OR d.phone LIKE $?)`
+      },
+      sql: (where, tail) => `SELECT d.id, d.name, d.phone, d.blood_type, COALESCE(d.town, d.city) AS city, d.gender, d.age, d.eligibility_status,
+          d.screening_reasons, d.last_donation_date, d.deferred_until, d.verified_at, d.created_at, d.last_inbound_at,
+          d.broadcast_opt_out, d.reviewed_at
+        FROM donors d ${where} ORDER BY d.created_at DESC NULLS LAST, d.id DESC ${tail}`,
+      phones: ['phone'],
+      csv: ['id', 'name', 'phone', 'blood_type', 'city', 'gender', 'age', 'eligibility_status', 'screening_reasons', 'last_donation_date', 'deferred_until', 'verified_at', 'created_at', 'last_inbound_at', 'broadcast_opt_out']
+    },
+    requests: {
+      filters: {
+        status: `COALESCE(r.status, 'open') = $?`,
+        blood_type: `r.blood_type_needed = $?`,
+        urgency: `r.urgency = $?`,
+        city: `lower(COALESCE(r.town, trim(r.location))) = lower($?)`
+      },
+      sql: (where, tail) => `SELECT r.id, r.requester_phone, r.blood_type_needed, r.units_needed, r.urgency, COALESCE(r.status, 'open') AS status,
+          COALESCE(r.town, r.location) AS location, r.hospital_name, f.name AS facility_name, r.contact_name, r.contact_phone,
+          r.created_at, r.fulfilled_at,
+          (SELECT COUNT(*) FROM matches m WHERE m.request_id = r.id) AS contacted,
+          (SELECT COUNT(*) FROM matches m WHERE m.request_id = r.id AND m.response = 'yes') AS yes
+        FROM requests r LEFT JOIN facilities f ON f.id = r.facility_id
+        ${where} ORDER BY r.created_at DESC NULLS LAST, r.id DESC ${tail}`,
+      phones: ['requester_phone', 'contact_phone'],
+      csv: ['id', 'blood_type_needed', 'units_needed', 'urgency', 'status', 'location', 'hospital_name', 'facility_name', 'requester_phone', 'contact_name', 'contact_phone', 'contacted', 'yes', 'created_at', 'fulfilled_at']
+    },
+    matches: {
+      filters: {
+        response: `COALESCE(m.response, 'no_reply') = $?`,
+        request_id: `m.request_id = $?::int`,
+        donor_id: `m.donor_id = $?::int`
+      },
+      sql: (where, tail) => `SELECT m.id, m.request_id, m.donor_id, d.name AS donor_name, d.phone, r.blood_type_needed, COALESCE(r.town, r.location) AS location,
+          COALESCE(m.response, 'no_reply') AS response, m.contacted_at, m.responded_at, m.confirm_code, m.donation_confirmed_at,
+          m.confirmed_by_facility_id IS NOT NULL AS confirmed_by_facility
+        FROM matches m LEFT JOIN donors d ON d.id = m.donor_id LEFT JOIN requests r ON r.id = m.request_id
+        ${where} ORDER BY m.contacted_at DESC NULLS LAST, m.id DESC ${tail}`,
+      phones: ['phone'],
+      csv: ['id', 'request_id', 'donor_id', 'donor_name', 'phone', 'blood_type_needed', 'location', 'response', 'contacted_at', 'responded_at', 'confirm_code', 'donation_confirmed_at', 'confirmed_by_facility']
+    },
+    facilities: {
+      filters: {
+        type: `type = $?`,
+        partner: `is_partner = ($? = 'yes')`
+      },
+      sql: (where, tail) => `SELECT id, name, type, city, staff_phone, is_partner, does_blood_collection, does_lab_tests, is_demo, created_at
+        FROM facilities ${where} ORDER BY is_partner DESC, city, name ${tail}`,
+      phones: ['staff_phone'],
+      csv: ['id', 'name', 'type', 'city', 'staff_phone', 'is_partner', 'does_blood_collection', 'does_lab_tests', 'created_at']
+    }
+  };
+  const LIST_NAMES = Object.keys(LISTS).join('|');
+
+  router.get(`/api/:list(${LIST_NAMES})`, api(async (req, res) => {
+    const spec = LISTS[req.params.list];
+    const q = listQuery(req, spec.filters);
+    const result = await pool.query(spec.sql(q.where, q.tail), q.params);
+    res.json({ rows: showPhones(req, result.rows, spec.phones) });
   }));
 
-  router.get('/api/requests', api(async (req, res) => {
-    const q = listQuery(req, {
-      status: `COALESCE(r.status, 'open') = $?`,
-      blood_type: `r.blood_type_needed = $?`,
-      urgency: `r.urgency = $?`,
-      city: `lower(COALESCE(r.town, trim(r.location))) = lower($?)`
-    });
-    const result = await pool.query(
-      `SELECT r.id, r.requester_phone, r.blood_type_needed, r.units_needed, r.urgency, COALESCE(r.status, 'open') AS status,
-         COALESCE(r.town, r.location) AS location, r.hospital_name, f.name AS facility_name, r.contact_name, r.contact_phone,
-         r.created_at, r.fulfilled_at,
-         (SELECT COUNT(*) FROM matches m WHERE m.request_id = r.id) AS contacted,
-         (SELECT COUNT(*) FROM matches m WHERE m.request_id = r.id AND m.response = 'yes') AS yes
-       FROM requests r LEFT JOIN facilities f ON f.id = r.facility_id
-       ${q.where} ORDER BY r.created_at DESC NULLS LAST, r.id DESC ${q.tail}`,
-      q.params
-    );
-    res.json({ rows: showPhones(req, result.rows, ['requester_phone', 'contact_phone']) });
+  // Same filters as the list, up to 10,000 rows. Phones stay masked unless "Show numbers" is on.
+  router.get(`/api/export/:list(${LIST_NAMES}).csv`, api(async (req, res) => {
+    const spec = LISTS[req.params.list];
+    const q = listQuery({ query: { ...req.query, limit: undefined, offset: undefined } }, spec.filters);
+    const result = await pool.query(spec.sql(q.where, 'LIMIT 10000'), q.params);
+    const day = new Date().toISOString().slice(0, 10);
+    res.set({ 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="lifedrop-${req.params.list}-${day}.csv"` });
+    res.send('﻿' + toCsv(showPhones(req, result.rows, spec.phones), spec.csv)); // BOM so Excel reads accents
   }));
 
-  router.get('/api/matches', api(async (req, res) => {
-    const q = listQuery(req, {
-      response: `COALESCE(m.response, 'no_reply') = $?`,
-      request_id: `m.request_id = $?::int`
+  // ----- Donor profile -----
+  router.get('/api/donors/:id(\\d+)', api(async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const [donor, matches, appointments, broadcasts] = await Promise.all([
+      pool.query(
+        `SELECT d.*, COALESCE(d.town, d.city) AS place, f.name AS verified_by
+         FROM donors d LEFT JOIN facilities f ON f.id = d.verified_by_facility_id WHERE d.id = $1`,
+        [id]
+      ),
+      pool.query(
+        `SELECT m.id, m.request_id, r.blood_type_needed, COALESCE(r.town, r.location) AS location, r.urgency,
+           COALESCE(m.response, 'no_reply') AS response, m.contacted_at, m.responded_at, m.confirm_code, m.donation_confirmed_at,
+           m.result_blood_group
+         FROM matches m LEFT JOIN requests r ON r.id = m.request_id WHERE m.donor_id = $1 ORDER BY m.contacted_at DESC NULLS LAST LIMIT 50`,
+        [id]
+      ),
+      pool.query(
+        `SELECT a.id, a.slot_at, a.status, f.name AS facility_name FROM appointments a
+         JOIN facilities f ON f.id = a.facility_id JOIN donors d ON d.phone = a.donor_phone
+         WHERE d.id = $1 ORDER BY a.slot_at DESC LIMIT 20`,
+        [id]
+      ),
+      pool.query(`SELECT COUNT(*) AS received FROM broadcast_recipients WHERE donor_id = $1 AND status = 'sent'`, [id])
+    ]);
+    if (!donor.rows.length) return res.status(404).json({ error: 'Donor not found.' });
+    const d = donor.rows[0];
+    const profile = {
+      id: d.id, name: d.name, phone: d.phone, blood_type: d.blood_type, place: d.place, gender: d.gender, age: d.age,
+      weight_kg: d.weight_kg, eligibility_status: d.eligibility_status, screening_reasons: d.screening_reasons,
+      deferred_until: d.deferred_until, last_donation_date: d.last_donation_date, verified_at: d.verified_at, verified_by: d.verified_by,
+      created_at: d.created_at, last_inbound_at: d.last_inbound_at, has_pin: d.lat != null, broadcast_opt_out: d.broadcast_opt_out,
+      reviewed_at: d.reviewed_at
+    };
+    res.json({
+      donor: showPhones(req, [profile])[0],
+      matches: matches.rows,
+      appointments: appointments.rows,
+      broadcastsReceived: Number(broadcasts.rows[0].received)
     });
-    const result = await pool.query(
-      `SELECT m.id, m.request_id, m.donor_id, d.name AS donor_name, d.phone, r.blood_type_needed, COALESCE(r.town, r.location) AS location,
-         COALESCE(m.response, 'no_reply') AS response, m.contacted_at, m.responded_at, m.confirm_code, m.donation_confirmed_at,
-         m.confirmed_by_facility_id IS NOT NULL AS confirmed_by_facility
-       FROM matches m LEFT JOIN donors d ON d.id = m.donor_id LEFT JOIN requests r ON r.id = m.request_id
-       ${q.where} ORDER BY m.contacted_at DESC NULLS LAST, m.id DESC ${q.tail}`,
-      q.params
-    );
-    res.json({ rows: showPhones(req, result.rows) });
   }));
 
-  router.get('/api/facilities', api(async (req, res) => {
-    const q = listQuery(req, {
-      type: `type = $?`,
-      partner: `is_partner = ($? = 'yes')`
-    });
+  // ----- Request status -----
+  router.post('/api/requests/:id/status', api(async (req, res) => {
+    const status = req.body?.status;
+    if (!REQUEST_STATUSES.includes(status)) return res.status(400).json({ error: 'status must be open, fulfilled or closed.' });
     const result = await pool.query(
-      `SELECT id, name, type, city, staff_phone, is_partner, does_blood_collection, does_lab_tests, is_demo, created_at
-       FROM facilities ${q.where} ORDER BY is_partner DESC, city, name ${q.tail}`,
-      q.params
+      `UPDATE requests SET status = $1::text,
+         fulfilled_at = CASE WHEN $1::text = 'fulfilled' THEN COALESCE(fulfilled_at, NOW()) WHEN $1::text = 'open' THEN NULL ELSE fulfilled_at END
+       WHERE id = $2 RETURNING id, status, fulfilled_at`,
+      [status, parseInt(req.params.id, 10)]
     );
-    res.json({ rows: showPhones(req, result.rows, ['staff_phone']) });
+    if (!result.rows.length) return res.status(404).json({ error: 'Request not found.' });
+    await logAction(`request_${status}`, 'request', result.rows[0].id);
+    res.json({ request: result.rows[0] });
+  }));
+
+  // ----- Activity log -----
+  router.get('/api/log', api(async (req, res) => {
+    const result = await pool.query(
+      `SELECT l.id, l.action, l.target_type, l.target_id, l.details, l.created_at,
+         CASE l.target_type
+           WHEN 'donor' THEN (SELECT name FROM donors WHERE id = l.target_id)
+           WHEN 'facility' THEN (SELECT name FROM facilities WHERE id = l.target_id)
+         END AS target_name
+       FROM admin_log l ORDER BY l.id DESC LIMIT 200`
+    );
+    res.json({ rows: result.rows });
   }));
 
   // ----- Hospitals / labs -----
@@ -388,6 +494,7 @@ function createDashboard({
       [name, type, town?.name || typedCity, phone, b.is_partner !== false,
        b.does_blood_collection ?? type !== 'lab', b.does_lab_tests ?? type === 'lab', town?.lat ?? null, town?.lng ?? null]
     );
+    await logAction('facility_added', 'facility', inserted.rows[0].id, { type, city: inserted.rows[0].city });
     res.status(201).json({ facility: inserted.rows[0], knownTown: Boolean(town) });
   }));
 
@@ -408,6 +515,8 @@ function createDashboard({
       params
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Facility not found.' });
+    const changed = Object.fromEntries(FACILITY_FLAGS.filter(f => typeof req.body[f] === 'boolean').map(f => [f, req.body[f]]));
+    await logAction('facility_updated', 'facility', result.rows[0].id, changed);
     res.json({ facility: result.rows[0] });
   }));
 
@@ -421,6 +530,7 @@ function createDashboard({
       [decision === 'approve' ? 'eligible' : 'not_eligible', parseInt(req.params.id, 10)]
     );
     if (!result.rows.length) return res.status(409).json({ error: 'Donor not found or no longer waiting for review.' });
+    await logAction(decision === 'approve' ? 'donor_approved' : 'donor_rejected', 'donor', result.rows[0].id);
     res.json({ donor: result.rows[0] });
   }));
 
@@ -561,6 +671,7 @@ function createDashboard({
       [text, JSON.stringify({ ...audience, label: describeAudience(audience) }), donors.length]
     );
     const id = inserted.rows[0].id;
+    await logAction('broadcast_sent', 'broadcast', id, { audience: describeAudience(audience), total: donors.length });
     running = runBroadcast(id, donors, text)
       .catch(async err => {
         console.error('Broadcast error:', err.message);
@@ -627,7 +738,7 @@ const isStopText = (text) => /^(stop|unsubscribe|stop updates)$/i.test(String(te
 const isStartText = (text) => /^start$/i.test(String(text || '').trim());
 
 module.exports = {
-  createDashboard, maskPhone, sessionToken, validSessionToken, parseCookies, withinWindow, broadcastPayload,
+  createDashboard, toCsv, maskPhone, sessionToken, validSessionToken, parseCookies, withinWindow, broadcastPayload,
   audienceFilter, describeAudience, requiredTemplates, templateStatusRows, isStopText, isStartText,
   STOP_PAYLOAD, MAX_BROADCAST_LENGTH
 };

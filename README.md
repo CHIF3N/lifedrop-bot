@@ -7,6 +7,17 @@ One web page to watch and run LifeDrop: stats, donors, requests, matches, hospit
 donor review, WhatsApp template status and broadcasts. Phone numbers are hidden unless you tick
 "Show phone numbers".
 
+### What you can do
+
+- **Overview**: live numbers and charts, refreshes itself every minute.
+- **Donors**: search and filter, approve or reject donors flagged by screening, click a name for their full profile and history.
+- **Requests**: mark a request *fulfilled*, *close* it (no longer needed: cancelled, duplicate, test) or *reopen* it.
+  Click "x contacted" to see which donors were asked.
+- **Hospitals & labs**: register a facility and switch partner / blood collection / lab tests on or off.
+- **CSV** button on every list: downloads what the filters show (phone numbers stay hidden unless "Show numbers" is on).
+- **Activity**: every change made from the dashboard (table `admin_log`).
+- **Templates** and **Broadcast**: see below.
+
 ### Setup on Render
 
 1. Render → your service → **Environment** → add:

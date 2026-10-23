@@ -24,6 +24,9 @@
     <symbol id="i-out" viewBox="0 0 24 24"><path d="M15 4h4.5v16H15M10 8l-4 4 4 4M6 12h10"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.5L4 8M4 4v4h4M4 13a8 8 0 0 0 14.6 4.5L20 16M20 20v-4h-4"/></symbol>
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
   </svg>
 
@@ -48,6 +51,7 @@
         <button data-tab="facilities"><svg><use href="#i-hospital"/></svg>Hospitals &amp; labs</button>
         <button data-tab="templates"><svg><use href="#i-file"/></svg>Templates</button>
         <button data-tab="broadcast"><svg><use href="#i-send"/></svg>Broadcast</button>
+        <button data-tab="log"><svg><use href="#i-clock"/></svg>Activity</button>
       </nav>
       <div class="sidebar-foot">
         <div class="conn"><span class="dot"></span><span id="conn-text">Live database</span></div>
@@ -133,6 +137,7 @@
           <select name="blood_type" class="blood-types"><option value="">All blood types</option></select>
           <input name="city" placeholder="Town">
           <button type="submit" class="btn">Apply</button>
+          <button type="button" class="btn" data-export="donors"><svg class="ico"><use href="#i-download"/></svg>CSV</button>
         </form>
         <div class="table-card"><table id="table-donors"></table></div>
       </section>
@@ -142,11 +147,12 @@
         <header class="page-head"><div><h1>Requests</h1><p class="muted">Blood requests and how many donors said yes.</p></div>
           <label class="toggle"><input type="checkbox" class="reveal"><svg><use href="#i-eye"/></svg>Show numbers</label></header>
         <form class="toolbar" data-list="requests">
-          <select name="status"><option value="">All statuses</option><option value="open">Open</option><option value="fulfilled">Fulfilled</option></select>
+          <select name="status"><option value="">All statuses</option><option value="open">Open</option><option value="fulfilled">Fulfilled</option><option value="closed">Closed</option></select>
           <select name="blood_type" class="blood-types"><option value="">All blood types</option></select>
           <select name="urgency"><option value="">All urgency</option><option>Emergency</option><option>Urgent</option><option>Routine</option></select>
           <input name="city" placeholder="Town">
           <button type="submit" class="btn">Apply</button>
+          <button type="button" class="btn" data-export="requests"><svg class="ico"><use href="#i-download"/></svg>CSV</button>
         </form>
         <div class="table-card"><table id="table-requests"></table></div>
       </section>
@@ -158,7 +164,9 @@
         <form class="toolbar" data-list="matches">
           <select name="response"><option value="">All replies</option><option value="yes">Yes</option><option value="no">No</option><option value="no_reply">No reply</option><option value="not_needed">Not needed</option></select>
           <input name="request_id" placeholder="Request #" inputmode="numeric">
+          <input name="donor_id" placeholder="Donor #" inputmode="numeric">
           <button type="submit" class="btn">Apply</button>
+          <button type="button" class="btn" data-export="matches"><svg class="ico"><use href="#i-download"/></svg>CSV</button>
         </form>
         <div class="table-card"><table id="table-matches"></table></div>
       </section>
@@ -189,6 +197,7 @@
           <select name="type"><option value="">All types</option><option value="hospital">Hospital</option><option value="lab">Lab</option><option value="blood_bank">Blood bank</option></select>
           <select name="partner"><option value="">Partner or not</option><option value="yes">Active partners</option><option value="no">Not active</option></select>
           <button type="submit" class="btn">Apply</button>
+          <button type="button" class="btn" data-export="facilities"><svg class="ico"><use href="#i-download"/></svg>CSV</button>
         </form>
         <div class="table-card"><table id="table-facilities"></table></div>
       </section>
@@ -250,8 +259,21 @@
           <div class="table-card"><table id="table-broadcast-recipients"></table></div>
         </div>
       </section>
+      <!-- Activity log -->
+      <section data-panel="log" hidden>
+        <header class="page-head"><div><h1>Activity</h1><p class="muted">Every change made from this dashboard, newest first.</p></div></header>
+        <div class="table-card"><table id="table-log"></table></div>
+      </section>
     </main>
   </div>
+
+  <dialog id="donor-drawer" class="drawer">
+    <div class="drawer-head">
+      <div id="drawer-title"></div>
+      <button id="drawer-close" class="icon-btn" type="button" title="Close"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div id="drawer-body"></div>
+  </dialog>
   <dialog id="confirm-dialog" class="dialog">
     <div class="dialog-icon"><svg><use href="#i-drop"/></svg></div>
     <h2 id="confirm-title">Are you sure?</h2>
