@@ -1,0 +1,275 @@
+{
+  "version": "6.0",
+  "screens": [
+    {
+      "id": "PERSONAL_INFO",
+      "title": "About you",
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "personal_form",
+            "children": [
+              { "type": "TextInput", "name": "name", "label": "Full name (as on your ID card)", "input-type": "text", "required": true },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "gender",
+                "label": "Sex",
+                "required": true,
+                "data-source": [
+                  { "id": "male", "title": "Male" },
+                  { "id": "female", "title": "Female" }
+                ]
+              },
+              { "type": "TextInput", "name": "age", "label": "Age (years)", "input-type": "number", "required": true },
+              { "type": "TextInput", "name": "weight_kg", "label": "Weight (kg)", "input-type": "number", "required": true },
+              { "type": "TextInput", "name": "country", "label": "Country", "input-type": "text", "required": true },
+              { "type": "TextInput", "name": "city", "label": "City or town", "input-type": "text", "required": true },
+              {
+                "type": "Dropdown",
+                "name": "blood_type",
+                "label": "Blood group",
+                "required": true,
+                "data-source": [
+                  { "id": "A+", "title": "A+" },
+                  { "id": "A-", "title": "A-" },
+                  { "id": "B+", "title": "B+" },
+                  { "id": "B-", "title": "B-" },
+                  { "id": "AB+", "title": "AB+" },
+                  { "id": "AB-", "title": "AB-" },
+                  { "id": "O+", "title": "O+" },
+                  { "id": "O-", "title": "O-" },
+                  { "id": "UNKNOWN", "title": "I don't know" }
+                ]
+              },
+              { "type": "TextInput", "name": "email", "label": "Email (optional)", "input-type": "email", "required": false },
+              {
+                "type": "Footer",
+                "label": "Next",
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": { "type": "screen", "name": "HEALTH_HISTORY" },
+                  "payload": {
+                    "name": "${form.name}",
+                    "gender": "${form.gender}",
+                    "age": "${form.age}",
+                    "weight_kg": "${form.weight_kg}",
+                    "country": "${form.country}",
+                    "city": "${form.city}",
+                    "blood_type": "${form.blood_type}",
+                    "email": "${form.email}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "HEALTH_HISTORY",
+      "title": "Health questions",
+      "data": {
+        "name": { "type": "string", "__example__": "Jean" },
+        "gender": { "type": "string", "__example__": "female" },
+        "age": { "type": "string", "__example__": "25" },
+        "weight_kg": { "type": "string", "__example__": "60" },
+        "country": { "type": "string", "__example__": "Cameroon" },
+        "city": { "type": "string", "__example__": "Douala" },
+        "blood_type": { "type": "string", "__example__": "O+" },
+        "email": { "type": "string", "__example__": "" }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "health_form",
+            "children": [
+              { "type": "TextBody", "text": "These questions keep you and the patient safe. Your answers are private. Tick only what applies to you." },
+              {
+                "type": "CheckboxGroup",
+                "name": "recent_conditions",
+                "label": "Recently, did you have any of these?",
+                "required": false,
+                "data-source": [
+                  { "id": "fever_2w", "title": "Fever/illness (last 2 weeks)" },
+                  { "id": "antibiotics_2w", "title": "Antibiotics (last 2 weeks)" },
+                  { "id": "tooth_7d", "title": "Tooth pulled (last 7 days)" },
+                  { "id": "vaccine_4w", "title": "Vaccine (last 4 weeks)" },
+                  { "id": "bp_med_change_4w", "title": "New BP medicine (last 4 wks)" },
+                  { "id": "malaria_6m", "title": "Malaria (last 6 months)" },
+                  { "id": "tattoo_12m", "title": "Tattoo/piercing/scars (12 mo)" },
+                  { "id": "surgery_12m", "title": "Major operation (12 months)" },
+                  { "id": "transfusion_12m", "title": "Got blood transfusion (12 mo)" },
+                  { "id": "jaundice_12m", "title": "Jaundice/hepatitis A (12 mo)" },
+                  { "id": "risky_partner_12m", "title": "Partner had HIV/hep (12 mo)" },
+                  { "id": "tb_2y", "title": "Tuberculosis (last 2 years)" }
+                ]
+              },
+              {
+                "type": "CheckboxGroup",
+                "name": "ever_conditions",
+                "label": "Have you EVER had any of these?",
+                "required": false,
+                "data-source": [
+                  { "id": "hiv", "title": "HIV positive" },
+                  { "id": "hepatitis_bc", "title": "Hepatitis B or C" },
+                  { "id": "syphilis", "title": "Syphilis" },
+                  { "id": "sickle_cell", "title": "Sickle cell disease (SS)" },
+                  { "id": "heart_stroke", "title": "Heart disease or stroke" },
+                  { "id": "insulin_diabetes", "title": "Diabetes needing insulin" },
+                  { "id": "bleeding_disorder", "title": "Bleeding disorder" },
+                  { "id": "cancer", "title": "Cancer" },
+                  { "id": "epilepsy", "title": "Epilepsy or seizures" },
+                  { "id": "injected_drugs", "title": "Injected drugs (not medical)" },
+                  { "id": "sex_work", "title": "Received money for sex" }
+                ]
+              },
+              {
+                "type": "If",
+                "condition": "${data.gender} == 'female'",
+                "then": [
+                  {
+                    "type": "CheckboxGroup",
+                    "name": "women_health",
+                    "label": "For women: does any of this apply?",
+                    "required": false,
+                    "data-source": [
+                      { "id": "pregnant", "title": "Pregnant or might be" },
+                      { "id": "breastfeeding", "title": "Breastfeeding" },
+                      { "id": "birth_6m", "title": "Birth/pregnancy loss (6 mo)" },
+                      { "id": "heavy_periods", "title": "Very heavy periods/anaemia" }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "on_medication",
+                "label": "Are you taking any medicine now?",
+                "required": true,
+                "data-source": [
+                  { "id": "yes", "title": "Yes" },
+                  { "id": "no", "title": "No" }
+                ]
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "chronic_condition",
+                "label": "Any other long-term illness?",
+                "required": true,
+                "data-source": [
+                  { "id": "yes", "title": "Yes" },
+                  { "id": "no", "title": "No" }
+                ]
+              },
+              {
+                "type": "Footer",
+                "label": "Next",
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": { "type": "screen", "name": "CONSENT" },
+                  "payload": {
+                    "name": "${data.name}",
+                    "gender": "${data.gender}",
+                    "age": "${data.age}",
+                    "weight_kg": "${data.weight_kg}",
+                    "country": "${data.country}",
+                    "city": "${data.city}",
+                    "blood_type": "${data.blood_type}",
+                    "email": "${data.email}",
+                    "recent_conditions": "${form.recent_conditions}",
+                    "ever_conditions": "${form.ever_conditions}",
+                    "women_health": "${form.women_health}",
+                    "on_medication": "${form.on_medication}",
+                    "chronic_condition": "${form.chronic_condition}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "CONSENT",
+      "title": "Last step",
+      "terminal": true,
+      "success": true,
+      "data": {
+        "name": { "type": "string", "__example__": "Jean" },
+        "gender": { "type": "string", "__example__": "female" },
+        "age": { "type": "string", "__example__": "25" },
+        "weight_kg": { "type": "string", "__example__": "60" },
+        "country": { "type": "string", "__example__": "Cameroon" },
+        "city": { "type": "string", "__example__": "Douala" },
+        "blood_type": { "type": "string", "__example__": "O+" },
+        "email": { "type": "string", "__example__": "" },
+        "recent_conditions": { "type": "array", "items": { "type": "string" }, "__example__": [] },
+        "ever_conditions": { "type": "array", "items": { "type": "string" }, "__example__": [] },
+        "women_health": { "type": "array", "items": { "type": "string" }, "__example__": [] },
+        "on_medication": { "type": "string", "__example__": "no" },
+        "chronic_condition": { "type": "string", "__example__": "no" }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "consent_form",
+            "children": [
+              { "type": "TextBody", "text": "The blood bank will still check your health and test your blood before you donate." },
+              {
+                "type": "CheckboxGroup",
+                "name": "consent",
+                "label": "Consent",
+                "required": true,
+                "min-selected-items": 1,
+                "data-source": [
+                  { "id": "agree", "title": "LifeDrop may contact me" }
+                ]
+              },
+              {
+                "type": "CheckboxGroup",
+                "name": "no_payment_ack",
+                "label": "Voluntary donation",
+                "required": true,
+                "min-selected-items": 1,
+                "data-source": [
+                  { "id": "agree", "title": "I understand donors are unpaid" }
+                ]
+              },
+              {
+                "type": "Footer",
+                "label": "Register",
+                "on-click-action": {
+                  "name": "complete",
+                  "payload": {
+                    "name": "${data.name}",
+                    "gender": "${data.gender}",
+                    "age": "${data.age}",
+                    "weight_kg": "${data.weight_kg}",
+                    "country": "${data.country}",
+                    "city": "${data.city}",
+                    "blood_type": "${data.blood_type}",
+                    "email": "${data.email}",
+                    "recent_conditions": "${data.recent_conditions}",
+                    "ever_conditions": "${data.ever_conditions}",
+                    "women_health": "${data.women_health}",
+                    "on_medication": "${data.on_medication}",
+                    "chronic_condition": "${data.chronic_condition}",
+                    "consent": "${form.consent}",
+                    "no_payment_ack": "${form.no_payment_ack}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
