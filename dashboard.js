@@ -8,6 +8,7 @@ const axios = require('axios');
 const geo = require('./geo');
 const { normalizePhone } = require('./admin');
 const { toTemplateParam, formatStatsReport } = require('./reports');
+const { REQUEST_REASONS } = require('./request-form');
 
 const COOKIE_NAME = 'ld_admin';
 const SESSION_HOURS = 12;
@@ -167,6 +168,66 @@ const imageTemplateBody = (to, name, mediaId, bodyParams, buttonPayloads = []) =
   }
 });
 
+// ---------- Any approved template ----------
+// Highest {{n}} in a text ("Hi {{1}}, {{2}}" -> 2)
+const countVars = (text) => Math.max(0, ...[...String(text || '').matchAll(/\{\{(\d+)\}\}/g)].map(m => Number(m[1])));
+
+// Meta's template definition -> what the dashboard needs to fill it in. Unsupported parts make it not sendable here.
+function describeTemplate(t) {
+  const comps = t.components || [];
+  const header = comps.find(c => c.type === 'HEADER');
+  const body = comps.find(c => c.type === 'BODY');
+  const footer = comps.find(c => c.type === 'FOOTER');
+  const buttons = (comps.find(c => c.type === 'BUTTONS')?.buttons || []).map((b, index) => ({
+    index, type: b.type, text: b.text, url: b.url || null, needsParam: b.type === 'URL' && /\{\{1\}\}/.test(b.url || '')
+  }));
+  const problems = [];
+  if (t.parameter_format === 'NAMED') problems.push('named variables');
+  if (header && !['TEXT', 'IMAGE'].includes(header.format)) problems.push(`${String(header.format).toLowerCase()} header`);
+  for (const b of buttons) if (!['URL', 'QUICK_REPLY', 'PHONE_NUMBER'].includes(b.type)) problems.push(`${b.type.toLowerCase()} button`);
+  return {
+    name: t.name,
+    language: t.language,
+    category: t.category,
+    status: t.status,
+    header: header ? { format: header.format, text: header.text || null, vars: header.format === 'TEXT' ? countVars(header.text) : 0 } : null,
+    body: body?.text || '',
+    bodyVars: countVars(body?.text),
+    footer: footer?.text || null,
+    buttons,
+    sendable: problems.length === 0,
+    problems
+  };
+}
+
+// Fill {{n}} with values, and {name} in values with the recipient's first name
+const fillVars = (text, values) => String(text || '').replace(/\{\{(\d+)\}\}/g, (m, n) => values[Number(n) - 1] ?? m);
+const personalise = (value, name, fullName = false) =>
+  String(value ?? '').replace(/\{name\}/gi, fullName ? toTemplateParam(name || 'friend', 60) : firstName(name)); // hospitals keep their full name
+
+// Components for one send. headerText/body/buttonParams are already personalised.
+function templateComponents(tpl, { headerText = null, headerImageId = null, body = [], buttonParams = {} } = {}) {
+  const components = [];
+  if (tpl.header?.format === 'TEXT' && tpl.header.vars > 0) components.push({ type: 'header', parameters: [{ type: 'text', text: toTemplateParam(headerText, 60) }] });
+  if (tpl.header?.format === 'IMAGE') components.push({ type: 'header', parameters: [{ type: 'image', image: { id: headerImageId } }] });
+  if (tpl.bodyVars > 0) components.push({ type: 'body', parameters: body.slice(0, tpl.bodyVars).map(v => ({ type: 'text', text: toTemplateParam(v) })) });
+  for (const b of tpl.buttons) {
+    if (b.needsParam) components.push({ type: 'button', sub_type: 'url', index: String(b.index), parameters: [{ type: 'text', text: String(buttonParams[b.index] || '') }] });
+  }
+  return components;
+}
+
+// What a filled-in template will look like (for the preview)
+function renderTemplate(tpl, { headerText = '', body = [], name = 'Jean', fullName = false } = {}) {
+  const values = body.map(v => personalise(v, name, fullName));
+  return [
+    tpl.header?.format === 'TEXT' ? `*${fillVars(tpl.header.text, [personalise(headerText, name, fullName)])}*` : null,
+    fillVars(tpl.body, values),
+    tpl.footer ? `_${tpl.footer}_` : null,
+    tpl.buttons.length ? tpl.buttons.map(b => `[ ${b.text} ]`).join('  ') : null
+  ].filter(Boolean).join('\n\n');
+}
+
 // Spreadsheet-safe CSV. Cells starting with = + - @ are prefixed so Excel never runs them as formulas.
 function toCsv(rows, columns) {
   const cell = (v) => {
@@ -196,6 +257,8 @@ function createDashboard({
   shareLink = process.env.BOT_SHARE_LINK || 'https://wa.me/237686001785?text=Hi',
   sendImage, // (to, mediaId, caption); defaults to the Graph API below
   sendImageTemplate, // (to, name, mediaId, bodyParams, buttonPayloads)
+  sendTemplateRaw, // (to, name, language, components); any template, defaults to the Graph API
+  createRequest, // the bot's saveRequestAndMatch(phone, data) -> { requestId, matchCount }
   templatesFile = path.join(__dirname, 'templates', 'WHATSAPP_TEMPLATES.md')
 }) {
   const router = express.Router();
@@ -613,24 +676,233 @@ function createDashboard({
     const required = requiredTemplates(fs.readFileSync(templatesFile, 'utf8'));
     const meta = [];
     let url = `https://graph.facebook.com/v22.0/${wabaId}/message_templates`;
-    let params = { fields: 'name,status,category,language', limit: 200 };
+    let params = { fields: 'name,status,category,language,components,parameter_format', limit: 200 };
     for (let page = 0; url && page < 10; page++) {
       const r = await axios.get(url, { params, headers: { Authorization: `Bearer ${whatsappToken}` } });
       meta.push(...(r.data?.data || []));
       url = r.data?.paging?.next || null;
       params = undefined; // the "next" link already carries them
     }
-    const data = { configured: true, checkedAt: new Date().toISOString(), rows: templateStatusRows(required, meta) };
+    const data = { configured: true, checkedAt: new Date().toISOString(), rows: templateStatusRows(required, meta), meta };
     templateCache = { at: Date.now(), data };
     return data;
   }
 
   router.get('/api/templates', api(async (req, res) => {
     try {
-      res.json(await templateStatus(req.query.refresh === '1'));
+      const { meta, ...data } = await templateStatus(req.query.refresh === '1');
+      res.json(data);
     } catch (err) {
       res.status(502).json({ error: 'Could not reach Meta: ' + errorText(err) });
     }
+  }));
+
+  // ----- Send any approved template -----
+  sendTemplateRaw = sendTemplateRaw || ((to, name, language, components) => axios.post(`${GRAPH}/${phoneNumberId}/messages`, {
+    messaging_product: 'whatsapp', to, type: 'template', template: { name, language: { code: language }, components }
+  }, { headers: graphHeaders }));
+
+  async function approvedTemplates(force = false) {
+    const t = await templateStatus(force);
+    if (!t.configured) return null;
+    return (t.meta || []).filter(m => m.status === 'APPROVED').map(describeTemplate);
+  }
+
+  router.get('/api/templates/sendable', api(async (req, res) => {
+    try {
+      const list = await approvedTemplates(req.query.refresh === '1');
+      if (!list) return res.json({ configured: false, templates: [] });
+      res.json({ configured: true, templates: list.sort((a, b) => a.name.localeCompare(b.name)) });
+    } catch (err) {
+      res.status(502).json({ error: 'Could not reach Meta: ' + errorText(err) });
+    }
+  }));
+
+  // Who gets it: one number, one donor, one hospital/lab, all partner facilities, or a donor audience
+  async function templateRecipients(r = {}) {
+    if (r.type === 'phone') {
+      const phone = normalizePhone(r.value);
+      if (!phone) return { error: 'Type a valid WhatsApp number (e.g. 677123456).' };
+      const known = await pool.query(`SELECT id, name FROM donors WHERE phone = $1`, [phone]);
+      return { label: `number ${maskPhone(phone)}`, list: [{ phone, name: known.rows[0]?.name || null, donor_id: known.rows[0]?.id || null }] };
+    }
+    if (r.type === 'donor') {
+      const d = await pool.query(`SELECT id, name, phone FROM donors WHERE id = $1 AND phone IS NOT NULL`, [parseInt(r.value, 10)]);
+      if (!d.rows.length) return { error: 'Donor not found.' };
+      return { label: `donor ${d.rows[0].name || '#' + d.rows[0].id}`, list: [{ phone: d.rows[0].phone, name: d.rows[0].name, donor_id: d.rows[0].id }] };
+    }
+    if (r.type === 'facility') {
+      const f = await pool.query(`SELECT id, name, staff_phone FROM facilities WHERE id = $1 AND staff_phone IS NOT NULL`, [parseInt(r.value, 10)]);
+      if (!f.rows.length) return { error: 'Hospital not found, or it has no staff phone.' };
+      return { label: f.rows[0].name, list: [{ phone: f.rows[0].staff_phone, name: f.rows[0].name, donor_id: null, fullName: true }] };
+    }
+    if (r.type === 'partners') {
+      const f = await pool.query(`SELECT name, staff_phone FROM facilities WHERE is_partner AND is_demo IS NOT TRUE AND staff_phone IS NOT NULL ORDER BY id`);
+      return { label: 'all partner hospitals and labs', list: f.rows.map(x => ({ phone: x.staff_phone, name: x.name, donor_id: null, fullName: true })) };
+    }
+    if (r.type === 'donors') {
+      const filter = audienceFilter(r.audience || {});
+      if (filter.error) return { error: filter.error };
+      const d = await pool.query(`SELECT id, name, phone FROM donors WHERE ${filter.where} ORDER BY id`, filter.params);
+      return { label: describeAudience(r.audience || {}), list: d.rows.map(x => ({ phone: x.phone, name: x.name, donor_id: x.id })) };
+    }
+    return { error: 'Choose who gets it.' };
+  }
+
+  async function checkTemplateRequest(b) {
+    const list = await approvedTemplates();
+    if (!list) return { status: 400, error: 'Add WABA_ID on Render to send templates.' };
+    const tpl = list.find(t => t.name === b.template && (!b.language || t.language === b.language));
+    if (!tpl) return { status: 400, error: 'Pick an approved template.' };
+    if (!tpl.sendable) return { status: 400, error: `This template can't be sent from here (${tpl.problems.join(', ')}).` };
+    const body = Array.isArray(b.body) ? b.body.map(v => String(v ?? '').trim()) : [];
+    if (body.length < tpl.bodyVars || body.slice(0, tpl.bodyVars).some(v => !v)) return { status: 400, error: `Fill in all ${tpl.bodyVars} blank(s).` };
+    if (tpl.header?.vars && !String(b.header_text || '').trim()) return { status: 400, error: 'Fill in the header.' };
+    if (tpl.header?.format === 'IMAGE' && !/^\d{5,30}$/.test(String(b.image?.media_id || ''))) return { status: 400, error: 'This template needs an image.' };
+    for (const btn of tpl.buttons) if (btn.needsParam && !String(b.button_params?.[btn.index] || '').trim()) return { status: 400, error: `Fill in the link for "${btn.text}".` };
+    const recipients = await templateRecipients(b.recipients);
+    if (recipients.error) return { status: 400, error: recipients.error };
+    if (!recipients.list.length) return { status: 400, error: 'Nobody matches.' };
+    return { tpl, body, recipients };
+  }
+
+  router.post('/api/template-send/preview', api(async (req, res) => {
+    const b = req.body || {};
+    const list = await approvedTemplates();
+    const tpl = list?.find(t => t.name === b.template && (!b.language || t.language === b.language));
+    if (!tpl) return res.status(400).json({ error: 'Pick an approved template.' });
+    const recipients = await templateRecipients(b.recipients);
+    if (recipients.error) return res.status(400).json({ error: recipients.error });
+    const first = recipients.list[0];
+    res.json({
+      label: recipients.label,
+      total: recipients.list.length,
+      sample: renderTemplate(tpl, { headerText: b.header_text, body: b.body || [], name: first?.name || 'Jean', fullName: first?.fullName }),
+      sampleFor: first?.name || null,
+      secondsEstimate: Math.ceil((recipients.list.length * delayMs) / 1000)
+    });
+  }));
+
+  async function runTemplateJob(id, tpl, recipients, b) {
+    let sent = 0, failed = 0;
+    for (let i = 0; i < recipients.length; i++) {
+      const r = recipients[i];
+      let status = 'sent', error = null;
+      try {
+        await sendTemplateRaw(r.phone, tpl.name, tpl.language, templateComponents(tpl, {
+          headerText: personalise(b.header_text, r.name, r.fullName),
+          headerImageId: b.image?.media_id || null,
+          body: b.body.map(v => personalise(v, r.name, r.fullName)),
+          buttonParams: b.button_params || {}
+        }));
+        sent++;
+      } catch (err) {
+        status = 'failed';
+        error = errorText(err);
+        failed++;
+      }
+      await pool.query(
+        `INSERT INTO broadcast_recipients (broadcast_id, donor_id, phone, channel, status, error) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [id, r.donor_id, r.phone, `template:${tpl.name}`, status, error]
+      ).catch(err => console.error('Template log error:', err.message));
+      if (i < recipients.length - 1 && delayMs > 0) await sleep(delayMs);
+    }
+    await pool.query(
+      `UPDATE broadcasts SET status = 'done', sent = $2, failed = $3, via_template = $2, finished_at = NOW() WHERE id = $1`,
+      [id, sent, failed]
+    );
+  }
+
+  router.post('/api/template-send', api(async (req, res) => {
+    const b = req.body || {};
+    if (!allowSend) return res.status(403).json({ error: 'Sending is turned off here (local mode). Use the live dashboard on Render.' });
+    if (b.confirm !== true) return res.status(400).json({ error: 'Confirm first.' });
+    if (running) return res.status(409).json({ error: 'Another send is still running. Wait for it to finish.' });
+    const checked = await checkTemplateRequest(b);
+    if (checked.error) return res.status(checked.status).json({ error: checked.error });
+    const { tpl, body, recipients } = checked;
+    if (Number(b.expected_count) !== recipients.list.length) {
+      return res.status(409).json({ error: `The recipients changed (${recipients.list.length} now, preview said ${b.expected_count}). Preview again.` });
+    }
+    const summary = `[${tpl.name}] ${renderTemplate(tpl, { headerText: b.header_text, body, name: '{name}' })}`.slice(0, 2000);
+    const inserted = await pool.query(
+      `INSERT INTO broadcasts (message, audience, total, image_media_id) VALUES ($1, $2, $3, $4) RETURNING id`,
+      [summary, JSON.stringify({ ...(b.recipients || {}), label: recipients.label, template: tpl.name }), recipients.list.length, b.image?.media_id || null]
+    );
+    const id = inserted.rows[0].id;
+    await logAction('template_sent', 'broadcast', id, { template: tpl.name, to: recipients.label, total: recipients.list.length });
+    running = runTemplateJob(id, tpl, recipients.list, { ...b, body })
+      .catch(async err => {
+        console.error('Template send error:', err.message);
+        await pool.query(`UPDATE broadcasts SET status = 'interrupted', finished_at = NOW() WHERE id = $1`, [id]).catch(() => {});
+      })
+      .finally(() => { running = null; });
+    res.status(202).json({ id, total: recipients.list.length });
+  }));
+
+  // ----- Message one donor (only inside WhatsApp's 24h window; outside it, a template is needed) -----
+  router.post('/api/donors/:id(\\d+)/message', api(async (req, res) => {
+    if (!allowSend) return res.status(403).json({ error: 'Sending is turned off here (local mode). Use the live dashboard on Render.' });
+    const text = String(req.body?.text || '').trim();
+    if (!text) return res.status(400).json({ error: 'Write a message first.' });
+    if (text.length > 1000) return res.status(400).json({ error: 'Message is too long (max 1000 characters).' });
+    const d = (await pool.query(`SELECT id, name, phone, last_inbound_at FROM donors WHERE id = $1`, [parseInt(req.params.id, 10)])).rows[0];
+    if (!d || !d.phone) return res.status(404).json({ error: 'Donor not found.' });
+    if (!withinWindow(d.last_inbound_at)) {
+      return res.status(409).json({ error: 'This donor has not messaged the bot in the last 24 hours, so WhatsApp only allows a template.', outsideWindow: true });
+    }
+    try {
+      await sendMessage(d.phone, text);
+    } catch (err) {
+      return res.status(502).json({ error: 'WhatsApp refused it: ' + errorText(err) });
+    }
+    await logAction('donor_messaged', 'donor', d.id, { length: text.length });
+    res.json({ ok: true });
+  }));
+
+  // ----- New blood request from the dashboard (phone-in requests). Uses the bot's own matching. -----
+  router.get('/api/request-options', api(async (req, res) => {
+    const f = await pool.query(`SELECT id, name, city FROM facilities WHERE is_partner AND does_blood_collection AND is_demo IS NOT TRUE ORDER BY city, name`);
+    res.json({ reasons: REQUEST_REASONS, facilities: f.rows, bloodTypes: BLOOD_TYPES, canCreate: Boolean(createRequest) });
+  }));
+
+  router.post('/api/requests', api(async (req, res) => {
+    if (!allowSend) return res.status(403).json({ error: 'Creating requests is turned off here (local mode): it contacts donors. Use the live dashboard on Render.' });
+    if (!createRequest) return res.status(501).json({ error: 'Request creation is not connected on this server.' });
+    const b = req.body || {};
+    if (b.confirm !== true) return res.status(400).json({ error: 'Confirm first.' });
+    const phone = normalizePhone(b.requester_phone);
+    if (!phone) return res.status(400).json({ error: "Type the requester's WhatsApp number (e.g. 677123456)." });
+    if (!BLOOD_TYPES.includes(b.blood_type_needed)) return res.status(400).json({ error: 'Pick the blood group needed.' });
+    const urgency = ['Emergency', 'Urgent', 'Routine'].includes(b.urgency) ? b.urgency : null;
+    if (!urgency) return res.status(400).json({ error: 'Pick the urgency.' });
+    const units = Math.min(Math.max(parseInt(b.units_needed, 10) || 1, 1), 20);
+    const typedTown = String(b.town || '').trim();
+    if (!typedTown) return res.status(400).json({ error: 'Type the town.' });
+    let facility = null;
+    if (b.facility_id) {
+      facility = (await pool.query(`SELECT id, name FROM facilities WHERE id = $1 AND is_partner`, [parseInt(b.facility_id, 10)])).rows[0];
+      if (!facility) return res.status(400).json({ error: 'That partner hospital was not found.' });
+    }
+    const town = geo.resolveTown(typedTown).town;
+    const contactPhone = b.contact_phone ? normalizePhone(b.contact_phone) : null;
+    if (b.contact_phone && !contactPhone) return res.status(400).json({ error: 'The contact phone is not valid.' });
+    const data = {
+      blood_type_needed: b.blood_type_needed,
+      units_needed: units,
+      urgency,
+      town: town?.name || null,
+      location: town?.name || typedTown, // same as the WhatsApp flow: clean town name when known
+      facility_id: facility?.id || null,
+      hospital_name: facility?.name || String(b.hospital_name || '').trim().slice(0, 120) || null,
+      patient_name: String(b.patient_name || '').trim().slice(0, 80) || null,
+      reason: REQUEST_REASONS.some(r => r.id === b.reason) ? b.reason : null,
+      contact_name: String(b.contact_name || '').trim().slice(0, 80) || null,
+      contact_phone: contactPhone
+    };
+    const result = await createRequest(phone, data);
+    await logAction('request_created', 'request', result.requestId, { matched: result.matchCount, blood: data.blood_type_needed, town: data.location });
+    res.status(201).json({ requestId: result.requestId, matchCount: result.matchCount, knownTown: Boolean(town) });
   }));
 
   // ----- Broadcasts -----
@@ -824,6 +1096,6 @@ const isStartText = (text) => /^start$/i.test(String(text || '').trim());
 module.exports = {
   createDashboard, toCsv, maskPhone, sessionToken, validSessionToken, parseCookies, withinWindow, broadcastPayload,
   audienceFilter, describeAudience, requiredTemplates, templateStatusRows, isStopText, isStartText,
-  detectImageType, imageMessageBody, imageTemplateBody,
+  detectImageType, imageMessageBody, imageTemplateBody, describeTemplate, templateComponents, renderTemplate, countVars, personalise,
   STOP_PAYLOAD, MAX_BROADCAST_LENGTH, BROADCAST_IMAGE_TEMPLATE, JOIN_LINK, SITE_LINK
 };

@@ -2150,7 +2150,7 @@ async function sendList(to, headerText, bodyText, buttonText, sections) {
 }
 
 // Admin web dashboard at /admin (needs ADMIN_KEY)
-const dashboard = createDashboard({ pool, getStats, sendMessage, sendTemplate });
+const dashboard = createDashboard({ pool, getStats, sendMessage, sendTemplate, createRequest: saveRequestAndMatch });
 app.use('/admin', dashboard.router);
 
 // Short link to the donor community (WhatsApp template buttons can't link to WhatsApp directly)

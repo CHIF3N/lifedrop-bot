@@ -16,7 +16,12 @@ donor review, WhatsApp template status and broadcasts. Phone numbers are hidden 
 - **Hospitals & labs**: register a facility and switch partner / blood collection / lab tests on or off.
 - **CSV** button on every list: downloads what the filters show (phone numbers stay hidden unless "Show numbers" is on).
 - **Activity**: every change made from the dashboard (table `admin_log`).
-- **Templates** and **Broadcast**: see below.
+- **Templates**: send **any approved template** to one number, one donor, one hospital/lab, all partner hospitals,
+  or donors (all / blood type / town). Fill the blanks (`{name}` = each person's first name), preview, confirm, send.
+  Results show under Broadcast → Past broadcasts.
+- **Donor profile → Message this donor**: a normal message if they wrote in the last 24h; otherwise a button to send a template.
+- **Requests → + New request**: for someone who called or walked in. Uses the bot's own matching and contacts donors immediately.
+- **Broadcast**: see below.
 
 ### Setup on Render
 

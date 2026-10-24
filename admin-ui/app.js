@@ -190,7 +190,7 @@ function loadTab(tab) {
     requests: () => loadList('requests'),
     matches: () => loadList('matches'),
     facilities: () => loadList('facilities'),
-    templates: () => loadTemplates(false),
+    templates: () => Promise.all([loadTemplates(false), loadSendable(false)]),
     broadcast: loadBroadcastTab,
     log: loadLog
   };
@@ -603,6 +603,7 @@ async function openDonor(id) {
           el('div', { class: 'cell-sub' }, `${fmtDate(m.contacted_at)}${m.donation_confirmed_at ? ` · donated ${fmtDay(m.donation_confirmed_at)}` : ''}${m.confirm_code ? ` · ${m.confirm_code}` : ''}`)),
         badge(m.donation_confirmed_at ? 'Donated' : t, m.donation_confirmed_at ? 'ok' : tone));
     }) : el('p', { class: 'empty-note' }, 'Not contacted for any request yet.')),
+    messageBox(d),
     appointments.length ? el('h2', {}, 'Lab bookings') : null,
     appointments.length ? el('div', { class: 'timeline' }, appointments.map(a => el('div', { class: 'tl-item' }, el('span'),
       el('div', {}, el('div', { class: 'cell-main' }, a.facility_name), el('div', { class: 'cell-sub' }, fmtDate(a.slot_at))), badge(a.status, a.status === 'booked' ? 'info' : '')))) : null
@@ -611,12 +612,241 @@ async function openDonor(id) {
   if (!$('#donor-drawer').open) $('#donor-drawer').showModal();
 }
 
+// Inside 24h: type a normal message. Outside: WhatsApp only allows a template, so offer that.
+function messageBox(d) {
+  const open = d.last_inbound_at && Date.now() - new Date(d.last_inbound_at).getTime() < 24 * 3600 * 1000;
+  if (!open) {
+    return el('div', { class: 'msg-box' },
+      el('h2', {}, 'Message this donor'),
+      el('p', { class: 'muted small' }, `Last message ${ago(d.last_inbound_at) || 'never'}. WhatsApp only allows a template outside the 24-hour window.`),
+      el('button', { class: 'btn primary', onclick: () => sendTemplateTo('donor', d.id) }, 'Send a template'));
+  }
+  const box = el('textarea', { rows: '3', maxlength: '1000', placeholder: `Message to ${d.name || 'this donor'}…` });
+  const send = async () => {
+    const text = box.value.trim();
+    if (!text) return;
+    const yes = await askConfirm({ title: `Send to ${d.name || 'this donor'}?`, text: text.length > 140 ? `${text.slice(0, 140)}…` : text, confirmLabel: 'Send', tone: 'primary' });
+    if (!yes) return;
+    try {
+      await api(`/admin/api/donors/${d.id}/message`, { method: 'POST', body: { text } });
+      box.value = '';
+      toast('Message sent.');
+    } catch (err) { toast(err.message, true); }
+  };
+  return el('div', { class: 'msg-box' },
+    el('h2', {}, 'Message this donor'),
+    box,
+    el('div', { class: 'row-end' },
+      el('p', { class: 'muted small' }, `Active ${ago(d.last_inbound_at)}: a normal message is allowed.`),
+      el('button', { class: 'btn primary', onclick: send }, 'Send')));
+}
+
+// ---------- New request ----------
+const rForm = $('#request-form');
+let requestOptionsLoaded = false;
+$('#new-request-toggle').addEventListener('click', async () => {
+  rForm.hidden = !rForm.hidden;
+  if (rForm.hidden || requestOptionsLoaded) return;
+  try {
+    const o = await api('/admin/api/request-options');
+    rForm.elements.facility_id.append(...o.facilities.map(f => el('option', { value: f.id }, `${f.name} (${f.city || '?'})`)));
+    rForm.elements.reason.append(...o.reasons.map(r => el('option', { value: r.id }, r.title)));
+    requestOptionsLoaded = true;
+    if (!o.canCreate) toast('Request creation is not connected on this server.', true);
+  } catch (err) { toast(err.message, true); }
+});
+$('#request-cancel').addEventListener('click', () => { rForm.hidden = true; });
+rForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = rForm.elements;
+  const body = Object.fromEntries(['requester_phone', 'blood_type_needed', 'units_needed', 'urgency', 'town', 'facility_id', 'hospital_name', 'reason', 'patient_name', 'contact_name', 'contact_phone'].map(k => [k, f[k].value.trim()]));
+  if (!body.blood_type_needed) return toast('Pick the blood group needed.', true);
+  const yes = await askConfirm({
+    title: `${body.blood_type_needed} · ${body.units_needed || 1} unit(s) · ${body.town}`,
+    text: 'The bot will contact matching donors on WhatsApp right away. Continue?',
+    confirmLabel: 'Create request', tone: 'danger'
+  });
+  if (!yes) return;
+  try {
+    const r = await api('/admin/api/requests', { method: 'POST', body: { ...body, confirm: true } });
+    toast(`Request #${r.requestId} created: ${r.matchCount ? `${r.matchCount} donor(s) contacted` : 'no donor available, support was alerted'}.${r.knownTown ? '' : ' ⚠️ Unknown town.'}`, !r.matchCount);
+    rForm.reset();
+    rForm.hidden = true;
+    loadList('requests');
+  } catch (err) { toast(err.message, true); }
+});
+
+// ---------- Send any template ----------
+const tForm = $('#tpl-form');
+let sendable = [];
+let tplImageFile = null;
+let tplImageUrl = null;
+let pendingTemplate = null;
+
+const currentTemplate = () => sendable.find(t => `${t.name}|${t.language}` === tForm.template.value);
+
+async function loadSendable(refresh) {
+  const data = await api(`/admin/api/templates/sendable${refresh ? '?refresh=1' : ''}`);
+  const keep = tForm.template.value;
+  sendable = data.templates || [];
+  tForm.template.replaceChildren(
+    el('option', { value: '' }, data.configured ? (sendable.length ? 'Choose a template…' : 'No approved templates yet') : 'Add WABA_ID on Render first'),
+    ...sendable.map(t => el('option', { value: `${t.name}|${t.language}` }, `${t.name} · ${t.category.toLowerCase()}${t.sendable ? '' : ' (not supported here)'}`)));
+  if (keep) tForm.template.value = keep;
+  renderTemplateFields();
+  if (!tForm.rfacility.options.length) {
+    const { rows } = await api('/admin/api/facilities?partner=yes');
+    tForm.rfacility.replaceChildren(...rows.filter(r => !r.is_demo).map(r => el('option', { value: r.id }, `${r.name} (${r.city || '?'})`)));
+  }
+}
+
+function renderTemplateFields() {
+  hideTemplatePreview();
+  const t = currentTemplate();
+  const box = $('#tpl-fields');
+  box.replaceChildren();
+  $('#tpl-image-pick').hidden = !(t?.header?.format === 'IMAGE');
+  $('#tpl-problem').hidden = !t || t.sendable;
+  if (!t) return;
+  if (!t.sendable) $('#tpl-problem').textContent = `This template can't be sent from the dashboard yet: ${t.problems.join(', ')}.`;
+  box.append(el('div', { class: 'tpl-body' }, t.body));
+  if (t.header?.format === 'TEXT' && t.header.vars) box.append(el('label', { class: 'field' }, `Header: ${t.header.text}`, el('input', { name: 'tpl_header', required: true })));
+  for (let i = 1; i <= t.bodyVars; i++) {
+    box.append(el('label', { class: 'field' }, `Blank {{${i}}}`, el('input', { 'data-var': i, required: true, placeholder: i === 1 ? '{name}' : '' })));
+  }
+  for (const b of t.buttons.filter(x => x.needsParam)) {
+    box.append(el('label', { class: 'field' }, `Link ending for "${b.text}" (${b.url})`, el('input', { 'data-btn': b.index, required: true })));
+  }
+}
+
+function templateRecipientsFromForm() {
+  const type = tForm.rtype.value;
+  if (type === 'phone') return { type, value: tForm.rphone.value };
+  if (type === 'donor') return { type, value: tForm.rdonor.value };
+  if (type === 'facility') return { type, value: tForm.rfacility.value };
+  if (type === 'partners') return { type };
+  const aud = tForm.raud.value;
+  return { type, audience: { type: aud, value: aud === 'blood_type' ? tForm.rblood.value : aud === 'city' ? tForm.rcity.value.trim() : undefined } };
+}
+
+function syncRecipientFields() {
+  const type = tForm.rtype.value;
+  for (const label of tForm.querySelectorAll('[data-r]')) {
+    const r = label.dataset.r;
+    label.hidden = !(r === type || (type === 'donors' && r === `donors-${tForm.raud.value === 'blood_type' ? 'blood' : tForm.raud.value}`));
+  }
+  hideTemplatePreview();
+}
+
+function hideTemplatePreview() {
+  pendingTemplate = null;
+  $('#tpl-preview').hidden = true;
+  $('#tpl-preview-empty').hidden = false;
+}
+
+function sendTemplateTo(type, value) {
+  $('#donor-drawer').open && $('#donor-drawer').close();
+  openTab('templates');
+  tForm.rtype.value = type;
+  if (type === 'donor') tForm.rdonor.value = value;
+  syncRecipientFields();
+  $('#tpl-composer').scrollIntoView({ behavior: 'smooth' });
+}
+
+tForm.template.addEventListener('change', renderTemplateFields);
+tForm.rtype.addEventListener('change', syncRecipientFields);
+tForm.raud.addEventListener('change', syncRecipientFields);
+tForm.addEventListener('input', (e) => { if (e.target.name !== 'template') hideTemplatePreview(); });
+tForm.tpl_image.addEventListener('change', () => {
+  const file = tForm.tpl_image.files[0];
+  if (tplImageUrl) URL.revokeObjectURL(tplImageUrl);
+  tplImageFile = null; tplImageUrl = null;
+  if (file && (!['image/jpeg', 'image/png'].includes(file.type) || file.size > 5 * 1024 * 1024)) {
+    toast('Pick a JPG or PNG under 5 MB.', true);
+    tForm.tpl_image.value = '';
+  } else if (file) {
+    tplImageFile = file;
+    tplImageUrl = URL.createObjectURL(file);
+  }
+  hideTemplatePreview();
+});
+
+function templateRequestBody() {
+  const t = currentTemplate();
+  return {
+    template: t?.name,
+    language: t?.language,
+    header_text: tForm.querySelector('[name=tpl_header]')?.value || '',
+    body: [...tForm.querySelectorAll('[data-var]')].map(i => i.value),
+    button_params: Object.fromEntries([...tForm.querySelectorAll('[data-btn]')].map(i => [i.dataset.btn, i.value.trim()])),
+    recipients: templateRecipientsFromForm()
+  };
+}
+
+tForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const t = currentTemplate();
+  if (!t) return toast('Pick a template first.', true);
+  if (!t.sendable) return toast($('#tpl-problem').textContent, true);
+  if (t.header?.format === 'IMAGE' && !tplImageFile) return toast('This template needs an image.', true);
+  const body = templateRequestBody();
+  try {
+    const p = await api('/admin/api/template-send/preview', { method: 'POST', body });
+    pendingTemplate = { body, total: p.total };
+    $('#tpl-total').textContent = fmt(p.total);
+    $('#tpl-summary').textContent = `To ${p.label}.${p.total > 1 ? ` Sending takes about ${p.secondsEstimate} s.` : ''}`;
+    $('#tpl-preview-text').textContent = p.sample;
+    $('#tpl-preview-meta').textContent = `Template ${t.name}${p.sampleFor ? ` · as ${p.sampleFor} will see it` : ''}`;
+    $('#tpl-preview-img').hidden = !tplImageUrl;
+    if (tplImageUrl) $('#tpl-preview-img').src = tplImageUrl;
+    $('#tpl-confirm').checked = false;
+    $('#tpl-send').disabled = true;
+    $('#tpl-send').textContent = `Send to ${fmt(p.total)}`;
+    $('#tpl-preview-empty').hidden = true;
+    $('#tpl-preview').hidden = false;
+  } catch (err) { toast(err.message, true); }
+});
+
+$('#tpl-confirm').addEventListener('change', (e) => { $('#tpl-send').disabled = !e.target.checked || !pendingTemplate?.total; });
+$('#tpl-cancel').addEventListener('click', hideTemplatePreview);
+$('#tpl-send').addEventListener('click', async () => {
+  if (!pendingTemplate) return;
+  const yes = await askConfirm({
+    title: `Send ${pendingTemplate.body.template} to ${pendingTemplate.total}?`,
+    text: 'This goes out on WhatsApp right away and cannot be undone.',
+    confirmLabel: 'Send now', tone: 'danger'
+  });
+  if (!yes) return;
+  $('#tpl-send').disabled = true;
+  try {
+    let image = null;
+    if (currentTemplate()?.header?.format === 'IMAGE') {
+      const res = await fetch('/admin/api/broadcast-image', {
+        method: 'POST',
+        headers: { 'Content-Type': tplImageFile.type, 'X-File-Name': tplImageFile.name.replace(/[^\w.\- ]/g, '_').slice(0, 80) },
+        body: tplImageFile
+      });
+      const up = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(up.error || `Image upload failed (${res.status})`);
+      image = { media_id: up.mediaId };
+    }
+    const { id, total } = await api('/admin/api/template-send', { method: 'POST', body: { ...pendingTemplate.body, image, expected_count: pendingTemplate.total, confirm: true } });
+    toast(`Sending #${id} to ${total}. Results are on the Broadcast page.`);
+    hideTemplatePreview();
+    openBroadcastId = id;
+  } catch (err) {
+    toast(err.message, true);
+    $('#tpl-send').disabled = false;
+  }
+});
+
 // ---------- Activity log ----------
 const ACTION_TEXT = {
   donor_approved: ['Donor approved', 'ok'], donor_rejected: ['Donor rejected', 'danger'],
   facility_added: ['Hospital/lab added', 'info'], facility_updated: ['Hospital/lab changed', 'info'],
   request_fulfilled: ['Request fulfilled', 'ok'], request_closed: ['Request closed', ''], request_open: ['Request reopened', 'warn'],
-  broadcast_sent: ['Broadcast sent', 'warn']
+  broadcast_sent: ['Broadcast sent', 'warn'], template_sent: ['Template sent', 'warn'],
+  donor_messaged: ['Donor messaged', 'info'], request_created: ['Request created', 'ok']
 };
 
 function describeLog(r) {
@@ -626,7 +856,8 @@ function describeLog(r) {
     const flags = Object.entries(det).filter(([k]) => k.startsWith('is_') || k.startsWith('does_')).map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v ? 'on' : 'off'}`);
     return `${r.target_name || 'Facility'} (#${r.target_id})${flags.length ? ` · ${flags.join(', ')}` : det.city ? ` · ${det.city}` : ''}`;
   }
-  if (r.target_type === 'request') return `Request #${r.target_id}`;
+  if (r.target_type === 'request') return `Request #${r.target_id}${det.matched != null ? ` · ${det.blood} · ${det.town} · ${det.matched} donor(s) contacted` : ''}`;
+  if (r.action === 'template_sent') return `${det.template} → ${det.to} · ${det.total} recipient(s) (#${r.target_id})`;
   if (r.target_type === 'broadcast') return `Broadcast #${r.target_id} · ${det.audience || ''} · ${det.total || 0} donor(s)`;
   return '';
 }
@@ -676,7 +907,7 @@ $('#facility-form').elements.type.addEventListener('change', (e) => {
 });
 
 // ---------- Templates ----------
-$('#templates-refresh').addEventListener('click', () => loadTemplates(true).catch(err => toast(err.message, true)));
+$('#templates-refresh').addEventListener('click', () => Promise.all([loadTemplates(true), loadSendable(true)]).catch(err => toast(err.message, true)));
 
 const TEMPLATE_STATUS = {
   APPROVED: ['Approved', 'ok'], PENDING: ['In review', 'warn'], REJECTED: ['Rejected', 'danger'],
@@ -886,7 +1117,7 @@ async function showBroadcast(id) {
   renderTable($('#table-broadcast-recipients'), recipients, [
     ['Donor', r => r.name],
     ['Phone', r => el('span', { class: 'mono' }, r.phone)],
-    ['Sent as', r => ({ text: 'Normal message', template: 'Template', image: 'Image message', image_template: 'Image template' }[r.channel] || r.channel)],
+    ['Sent as', r => ({ text: 'Normal message', template: 'Template', image: 'Image message', image_template: 'Image template' }[r.channel] || String(r.channel).replace('template:', 'Template '))],
     ['Result', r => (r.status === 'sent' ? badge('Sent', 'ok') : badge('Failed', 'danger'))],
     ['Error', r => (r.error ? el('span', { class: 'cell-sub' }, r.error) : '')],
     ['Time', r => fmtDate(r.sent_at)]

@@ -34,8 +34,23 @@ axios.get = async (url) => {
   return {
     data: {
       data: [
-        { name: 'hello_world', status: 'APPROVED', category: 'UTILITY', language: 'en_US' },
-        { name: 'donor_match_alert', status: 'PENDING', category: 'UTILITY', language: 'en' }
+        { name: 'hello_world', status: 'APPROVED', category: 'UTILITY', language: 'en_US', components: [{ type: 'BODY', text: 'Hello World' }] },
+        { name: 'donor_match_alert', status: 'PENDING', category: 'UTILITY', language: 'en', components: [{ type: 'BODY', text: 'x {{1}}' }] },
+        {
+          name: 'hospital_admin_notice', status: 'APPROVED', category: 'MARKETING', language: 'en',
+          components: [{ type: 'BODY', text: 'Hello {{1}} team, this is a message from LifeDrop administration: {{2}}\n\nReply to this message if you have questions.' }]
+        },
+        {
+          name: 'donor_broadcast', status: 'APPROVED', category: 'MARKETING', language: 'en',
+          components: [
+            { type: 'BODY', text: 'Hello {{1}}, a message from the LifeDrop team: {{2}}\n\nThank you for being a LifeDrop blood donor.' },
+            { type: 'BUTTONS', buttons: [{ type: 'URL', text: 'Join the group', url: 'https://lifedrop-bot.onrender.com/join' }, { type: 'URL', text: 'Visit website', url: 'https://lifedropcm.site' }] }
+          ]
+        },
+        {
+          name: 'donor_broadcast_image', status: 'APPROVED', category: 'MARKETING', language: 'en',
+          components: [{ type: 'HEADER', format: 'IMAGE' }, { type: 'BODY', text: 'Hello {{1}}, a message from the LifeDrop team: {{2}}\n\nThank you for being a LifeDrop blood donor.' }]
+        }
       ]
     }
   };

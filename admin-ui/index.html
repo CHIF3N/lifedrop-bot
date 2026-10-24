@@ -145,7 +145,31 @@
       <!-- Requests -->
       <section data-panel="requests" hidden>
         <header class="page-head"><div><h1>Requests</h1><p class="muted">Blood requests and how many donors said yes.</p></div>
-          <label class="toggle"><input type="checkbox" class="reveal"><svg><use href="#i-eye"/></svg>Show numbers</label></header>
+          <div class="head-actions">
+            <label class="toggle"><input type="checkbox" class="reveal"><svg><use href="#i-eye"/></svg>Show numbers</label>
+            <button type="button" class="btn primary" id="new-request-toggle">+ New request</button>
+          </div></header>
+        <form id="request-form" class="panel form-grid" hidden>
+          <h2 class="wide">New blood request (for someone who called or came in)</h2>
+          <label class="field">Requester's WhatsApp number <input name="requester_phone" required placeholder="677123456"></label>
+          <label class="field">Blood group needed <select name="blood_type_needed" class="blood-types" required><option value="">Choose</option></select></label>
+          <label class="field">Units <input name="units_needed" type="number" min="1" max="20" value="1"></label>
+          <label class="field">Urgency
+            <select name="urgency" required><option value="Emergency">Emergency</option><option value="Urgent" selected>Urgent</option><option value="Routine">Routine</option></select>
+          </label>
+          <label class="field">Town <input name="town" required placeholder="Buea"></label>
+          <label class="field">Partner hospital <select name="facility_id"><option value="">Not a partner / other</option></select></label>
+          <label class="field">Hospital name (if not a partner) <input name="hospital_name" placeholder="St. Mary's Clinic"></label>
+          <label class="field">Reason <select name="reason"><option value="">Not given</option></select></label>
+          <label class="field">Patient name (optional) <input name="patient_name"></label>
+          <label class="field">Contact person (optional) <input name="contact_name" placeholder="Paul"></label>
+          <label class="field">Contact phone (optional) <input name="contact_phone" placeholder="699000111"></label>
+          <div class="wide row-end">
+            <p class="muted small">The bot contacts matching donors right away, exactly like a WhatsApp request. Ask the requester to send "Hi" to the LifeDrop number so they can receive the donor's details.</p>
+            <button type="button" class="btn" id="request-cancel">Cancel</button>
+            <button type="submit" class="btn danger">Create and contact donors</button>
+          </div>
+        </form>
         <form class="toolbar" data-list="requests">
           <select name="status"><option value="">All statuses</option><option value="open">Open</option><option value="fulfilled">Fulfilled</option><option value="closed">Closed</option></select>
           <select name="blood_type" class="blood-types"><option value="">All blood types</option></select>
@@ -204,8 +228,65 @@
 
       <!-- Templates -->
       <section data-panel="templates" hidden>
-        <header class="page-head"><div><h1>WhatsApp templates</h1><p class="muted">Approval status from Meta. Templates are created in WhatsApp Manager.</p></div>
+        <header class="page-head"><div><h1>WhatsApp templates</h1><p class="muted">Send any approved template, and see what Meta has approved.</p></div>
           <button id="templates-refresh" class="btn"><svg class="ico"><use href="#i-refresh"/></svg>Check again</button></header>
+
+        <div class="grid broadcast-grid" id="tpl-composer">
+          <form id="tpl-form" class="panel span-2">
+            <h2>1. Pick a template</h2>
+            <label class="field">Approved template
+              <select name="template" id="tpl-select"><option value="">Loading…</option></select>
+            </label>
+            <p class="warn" id="tpl-problem" hidden></p>
+            <div id="tpl-fields" class="tpl-fields"></div>
+            <div id="tpl-image-pick" class="image-pick" hidden>
+              <label class="field">Header image (JPG or PNG, max 5 MB)
+                <input type="file" name="tpl_image" accept="image/jpeg,image/png">
+              </label>
+            </div>
+            <p class="muted small">Tip: write <b>{name}</b> in a blank and each person gets their own first name (hospitals get their full name).</p>
+            <h2>2. Who gets it</h2>
+            <div class="form-row">
+              <label class="field">Send to
+                <select name="rtype" id="tpl-rtype">
+                  <option value="phone">One WhatsApp number</option>
+                  <option value="donor">One donor (by #)</option>
+                  <option value="facility">One hospital or lab</option>
+                  <option value="partners">All partner hospitals and labs</option>
+                  <option value="donors">Donors (all / blood type / town)</option>
+                </select>
+              </label>
+              <label class="field" data-r="phone">WhatsApp number <input name="rphone" placeholder="677123456"></label>
+              <label class="field" data-r="donor" hidden>Donor # <input name="rdonor" inputmode="numeric" placeholder="12"></label>
+              <label class="field" data-r="facility" hidden>Hospital or lab <select name="rfacility"></select></label>
+              <label class="field" data-r="donors" hidden>Which donors
+                <select name="raud"><option value="all">All donors</option><option value="blood_type">One blood type</option><option value="city">One town</option></select>
+              </label>
+              <label class="field" data-r="donors-blood" hidden>Blood type <select name="rblood" class="blood-types"></select></label>
+              <label class="field" data-r="donors-city" hidden>Town <input name="rcity" placeholder="Buea"></label>
+            </div>
+            <button type="submit" class="btn primary">Preview</button>
+          </form>
+          <aside class="panel phone-panel">
+            <h2>3. Check</h2>
+            <div id="tpl-preview-empty" class="muted">Pick a template, fill the blanks and press Preview.</div>
+            <div id="tpl-preview" hidden>
+              <div class="preview-count"><strong id="tpl-total">0</strong><span>recipient(s)</span></div>
+              <p id="tpl-summary" class="small"></p>
+              <div class="phone">
+                <div class="bubble"><img class="bubble-img" id="tpl-preview-img" alt="" hidden><div id="tpl-preview-text"></div></div>
+                <div class="bubble-meta" id="tpl-preview-meta"></div>
+              </div>
+              <label class="check"><input type="checkbox" id="tpl-confirm"> I checked the text and the recipients</label>
+              <div class="row-end">
+                <button id="tpl-cancel" class="btn" type="button">Cancel</button>
+                <button id="tpl-send" class="btn danger" type="button" disabled>Send</button>
+              </div>
+            </div>
+          </aside>
+        </div>
+
+        <h2 class="section-title">Approval status</h2>
         <div class="kpis small" id="template-summary"></div>
         <div class="table-card"><table id="table-templates"></table></div>
       </section>
