@@ -96,9 +96,11 @@ Only send to donors who match the blood group and area and are not resting or pa
 ```
 Hello {{1}}, a message from the LifeDrop team: {{2}}
 
-Thank you for being a LifeDrop blood donor. Reply STOP to stop these updates.
+Thank you for being a LifeDrop blood donor.
 ```
-**Button** (Quick reply): `Stop updates`
+**Buttons** (Visit website, static URL):
+- `Join the group` → `https://lifedrop-bot.onrender.com/join` (redirects to the WhatsApp community; WhatsApp links aren't allowed on buttons)
+- `Visit website` → `https://lifedropcm.site`
 **Samples:** {{1}} `Jean` · {{2}} `Blood drive this Saturday at Buea Regional Hospital, 8am to 2pm. Bring your ID card.`
 
 ---
@@ -180,7 +182,7 @@ Inside the window, donors get a normal image message with the same text as the c
 ```
 Hello {{1}}, a message from the LifeDrop team: {{2}}
 
-Thank you for being a LifeDrop blood donor. Reply STOP to stop these updates.
+Thank you for being a LifeDrop blood donor.
 ```
-**Button** (Quick reply): `Stop updates`
+**Buttons**: same two links as `donor_broadcast` (`Join the group`, `Visit website`)
 **Samples:** {{1}} `Jean` · {{2}} `Healthy adults can give blood every 3 to 4 months. Invite a friend to join LifeDrop: https://wa.me/237686001785?text=Hi`

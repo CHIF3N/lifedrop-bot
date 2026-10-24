@@ -42,7 +42,8 @@ Logging in sets an HttpOnly cookie for 12 hours. Changing `ADMIN_KEY` logs every
   Inside the 24h window donors get an image message with the text as caption; everyone else gets the
   **`donor_broadcast_image`** template (image header), which must be approved first.
 - **+ Bot share link** adds `https://wa.me/237686001785?text=Hi` to the message (change it with the `BOT_SHARE_LINK` env var).
-- Donors who reply **STOP** (or tap "Stop updates") are never sent broadcasts again. **START** turns them back on.
+- Broadcasts end with two links (also buttons on the templates): **Join the group** (`/join` on the bot, which forwards to the WhatsApp community) and **Visit website** (lifedropcm.site).
+- A donor who still replies **STOP** is never sent broadcasts again; **START** turns them back on.
   Urgent blood requests still reach them.
 
 ### Open it on your laptop with the REAL data

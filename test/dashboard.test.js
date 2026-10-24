@@ -6,7 +6,7 @@ const express = require('express');
 const axios = require('axios');
 const {
   createDashboard, toCsv, detectImageType, imageMessageBody, imageTemplateBody, maskPhone, sessionToken, validSessionToken, parseCookies, broadcastPayload,
-  audienceFilter, requiredTemplates, templateStatusRows, isStopText, isStartText, STOP_PAYLOAD
+  audienceFilter, requiredTemplates, templateStatusRows, isStopText, isStartText, STOP_PAYLOAD, JOIN_LINK, SITE_LINK
 } = require('../dashboard');
 const { createTestPool } = require('./helpers/pglite-pool');
 
@@ -39,7 +39,9 @@ test('broadcast is a normal message inside the 24h window, else the donor_broadc
   const inside = broadcastPayload({ name: 'Jean Paul', last_inbound_at: new Date(now - HOUR) }, 'Drink water.\nEat well.', now);
   assert.strictEqual(inside.channel, 'text');
   assert.match(inside.text, /^Hello Jean, a message from the LifeDrop team:\n\nDrink water.\nEat well./);
-  assert.match(inside.text, /Reply STOP/);
+  assert.ok(!/STOP/.test(inside.text));
+  assert.ok(inside.text.endsWith(`Join the group: ${JOIN_LINK}\n🌐 ${SITE_LINK}`));
+  assert.strictEqual(JOIN_LINK, 'https://lifedrop-bot.onrender.com/join');
 
   const outside = broadcastPayload({ name: '', last_inbound_at: new Date(now - 25 * HOUR) }, 'Drink water.\nEat well.', now);
   assert.strictEqual(outside.channel, 'template');
@@ -246,7 +248,7 @@ test('broadcast: preview, confirm step, per-recipient log, opt-outs skipped', as
     const tpl = t.sent[1];
     assert.strictEqual(tpl.name, 'donor_broadcast');
     assert.deepStrictEqual(tpl.params, ['Marie', 'Drink water before you donate.']);
-    assert.deepStrictEqual(tpl.buttons, [STOP_PAYLOAD]);
+    assert.strictEqual(tpl.buttons, undefined); // template buttons are static links now
 
     const detail = await t.call('GET', `/api/broadcasts/${started.body.id}`);
     assert.strictEqual(detail.body.broadcast.status, 'done');
@@ -464,7 +466,7 @@ test('broadcast with an image: image message inside 24h, image template outside,
     assert.match(inWindow.caption, /^Hello Jean, a message from the LifeDrop team:\n\nGive blood/);
     assert.deepStrictEqual([outside.to, outside.type, outside.name, outside.mediaId], ['237600000002', 'image_template', 'donor_broadcast_image', '1234567890']);
     assert.deepStrictEqual(outside.params, ['Marie', body.message]);
-    assert.deepStrictEqual(outside.buttons, [STOP_PAYLOAD]);
+    assert.strictEqual(outside.buttons, undefined); // template buttons are static links now
 
     const detail = await t.call('GET', `/api/broadcasts/${started.body.id}`);
     assert.strictEqual(detail.body.broadcast.image_media_id, '1234567890');

@@ -17,7 +17,11 @@ const BROADCAST_TEMPLATE = 'donor_broadcast';
 const BROADCAST_IMAGE_TEMPLATE = 'donor_broadcast_image'; // same text, plus an IMAGE header
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // WhatsApp limit for images
 const GRAPH = 'https://graph.facebook.com/v22.0';
-const STOP_PAYLOAD = 'bcast_stop';
+const STOP_PAYLOAD = 'bcast_stop'; // old "Stop updates" button on messages sent before 24 Oct 2026; still honoured
+// Links shown on broadcasts. The templates have the same two as URL buttons (WhatsApp links aren't allowed on buttons, hence /join).
+const JOIN_LINK = process.env.BOT_JOIN_LINK || 'https://lifedrop-bot.onrender.com/join';
+const SITE_LINK = process.env.SITE_LINK || 'https://lifedropcm.site';
+const BROADCAST_FOOTER = 'Thank you for being a LifeDrop blood donor.';
 const BLOOD_TYPES = ['O+', 'O-', 'A+', 'A-', 'B+', 'B-', 'AB+', 'AB-'];
 const FACILITY_TYPES = ['hospital', 'lab', 'blood_bank'];
 const FACILITY_FLAGS = ['is_partner', 'does_blood_collection', 'does_lab_tests'];
@@ -72,7 +76,7 @@ function broadcastPayload(donor, message, now = Date.now()) {
   if (withinWindow(donor.last_inbound_at, now)) {
     return {
       channel: 'text',
-      text: `Hello ${name}, a message from the LifeDrop team:\n\n${String(message).trim()}\n\nThank you for being a LifeDrop blood donor. Reply STOP to stop these updates.`
+      text: `Hello ${name}, a message from the LifeDrop team:\n\n${String(message).trim()}\n\n${BROADCAST_FOOTER}\n\n👥 Join the group: ${JOIN_LINK}\n🌐 ${SITE_LINK}`
     };
   }
   return { channel: 'template', params: [name, toTemplateParam(message, MAX_BROADCAST_LENGTH)] };
@@ -676,7 +680,7 @@ function createDashboard({
       templateName,
       templateStatus: templateState,
       sampleText: broadcastPayload({ ...sample, last_inbound_at: new Date() }, message).text,
-      sampleTemplate: `Hello Jean, a message from the LifeDrop team: ${broadcastPayload(sample, message).params[1]}\n\nThank you for being a LifeDrop blood donor. Reply STOP to stop these updates.`,
+      sampleTemplate: `Hello Jean, a message from the LifeDrop team: ${broadcastPayload(sample, message).params[1]}\n\n${BROADCAST_FOOTER}\n\n[ Join the group ]  [ Visit website ]`,
       secondsEstimate: Math.ceil((counts.total * delayMs) / 1000)
     });
   }));
@@ -691,9 +695,9 @@ function createDashboard({
       let error = null;
       try {
         if (channel === 'text') await sendMessage(d.phone, payload.text);
-        else if (channel === 'template') await sendTemplate(d.phone, BROADCAST_TEMPLATE, payload.params, [STOP_PAYLOAD]);
+        else if (channel === 'template') await sendTemplate(d.phone, BROADCAST_TEMPLATE, payload.params); // URL buttons are static: no params
         else if (channel === 'image') await sendImage(d.phone, imageId, payload.text);
-        else await sendImageTemplate(d.phone, BROADCAST_IMAGE_TEMPLATE, imageId, payload.params, [STOP_PAYLOAD]);
+        else await sendImageTemplate(d.phone, BROADCAST_IMAGE_TEMPLATE, imageId, payload.params);
         sent++;
         if (payload.channel === 'text') viaText++; else viaTemplate++;
       } catch (err) {
@@ -821,5 +825,5 @@ module.exports = {
   createDashboard, toCsv, maskPhone, sessionToken, validSessionToken, parseCookies, withinWindow, broadcastPayload,
   audienceFilter, describeAudience, requiredTemplates, templateStatusRows, isStopText, isStartText,
   detectImageType, imageMessageBody, imageTemplateBody,
-  STOP_PAYLOAD, MAX_BROADCAST_LENGTH, BROADCAST_IMAGE_TEMPLATE
+  STOP_PAYLOAD, MAX_BROADCAST_LENGTH, BROADCAST_IMAGE_TEMPLATE, JOIN_LINK, SITE_LINK
 };
