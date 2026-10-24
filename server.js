@@ -173,6 +173,8 @@ app.get('/webhook', (req, res) => {
 // Webhook Event Receiver
 app.post('/webhook', async (req, res) => {
   try {
+    const statuses = req.body.entry?.[0]?.changes?.[0]?.value?.statuses;
+    if (statuses) await dashboard.recordStatuses(statuses).catch(err => console.warn('Status update error:', err.message));
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (message) {
       const from = message.from;
@@ -2053,7 +2055,7 @@ async function sendDonorFlow(to) {
 
 // Generic approved-template sender: body text params, plus one payload per quick-reply button
 async function sendTemplate(to, name, bodyParams, buttonPayloads = []) {
-  await axios.post(
+  return axios.post(
     `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
     {
       messaging_product: 'whatsapp',
@@ -2076,7 +2078,7 @@ async function sendTemplate(to, name, bodyParams, buttonPayloads = []) {
 }
 
 async function sendMessage(to, text) {
-  await axios.post(
+  return axios.post(
     `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
     { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
     { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }

@@ -1100,13 +1100,25 @@ async function loadBroadcasts() {
     ['Audience', r => r.audience?.label || ''],
     ['Message', r => el('span', { class: 'cell-sub' }, `${r.image_name ? '🖼 ' : ''}${r.message.length > 90 ? `${r.message.slice(0, 90)}…` : r.message}`)],
     ['Status', r => { const [t, tone] = BROADCAST_STATUS[r.status] || [r.status, '']; return badge(t, tone); }],
-    ['Sent', r => `${r.sent} / ${r.total}`],
-    ['Failed', r => (n(r.failed) ? badge(String(r.failed), 'danger') : '0')],
+    ['Accepted', r => `${r.sent} / ${r.total}`],
+    ['Delivered', r => (n(r.tracked) ? `${r.delivered}${n(r.read) ? ` · ${r.read} read` : ''}` : el('span', { class: 'cell-sub' }, 'not tracked'))],
+    ['Failed', r => (n(r.failed) + n(r.undelivered) ? badge(String(n(r.failed) + n(r.undelivered)), 'danger') : '0')],
     ['', r => el('button', { class: 'btn sm', onclick: () => showBroadcast(r.id) }, 'Details')]
   ], 'No broadcasts yet.');
+  const payment = rows.find(r => /^131042/.test(r.sample_error || ''));
+  $('#meta-warning').hidden = !payment;
+  if (payment) $('#meta-warning').textContent = '⚠️ Meta is not delivering template messages: the WhatsApp account has no valid payment method. Add one in WhatsApp Manager → Overview → "Add payment method". Until then only donors who wrote in the last 24 hours receive broadcasts.';
   if (openBroadcastId) await showBroadcast(openBroadcastId);
   clearTimeout(pollTimer);
   if (rows.some(r => r.status === 'sending') && currentTab === 'broadcast') pollTimer = setTimeout(() => loadBroadcasts().catch(() => {}), 3000);
+}
+
+// What really happened: refused straight away, accepted but not delivered, delivered, read
+function deliveryBadge(r) {
+  if (r.status !== 'sent') return badge('Refused', 'danger');
+  return {
+    failed: badge('Not delivered', 'danger'), read: badge('Read', 'ok'), delivered: badge('Delivered', 'ok')
+  }[r.delivery] || badge('Accepted', 'info');
 }
 
 async function showBroadcast(id) {
@@ -1118,8 +1130,8 @@ async function showBroadcast(id) {
     ['Donor', r => r.name],
     ['Phone', r => el('span', { class: 'mono' }, r.phone)],
     ['Sent as', r => ({ text: 'Normal message', template: 'Template', image: 'Image message', image_template: 'Image template' }[r.channel] || String(r.channel).replace('template:', 'Template '))],
-    ['Result', r => (r.status === 'sent' ? badge('Sent', 'ok') : badge('Failed', 'danger'))],
-    ['Error', r => (r.error ? el('span', { class: 'cell-sub' }, r.error) : '')],
+    ['Result', r => deliveryBadge(r)],
+    ['Error', r => ((r.delivery_error || r.error) ? el('span', { class: 'cell-sub' }, r.delivery_error || r.error) : '')],
     ['Time', r => fmtDate(r.sent_at)]
   ], 'Sending has not started yet.');
 }

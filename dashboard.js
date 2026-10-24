@@ -228,6 +228,29 @@ function renderTemplate(tpl, { headerText = '', body = [], name = 'Jean', fullNa
   ].filter(Boolean).join('\n\n');
 }
 
+// ---------- Delivery reports ----------
+// Meta accepts a message first (HTTP 200) and reports later if it was delivered, read or failed.
+const DELIVERY_RANK = { sent: 1, delivered: 2, read: 3 };
+const messageIdOf = (res) => res?.data?.messages?.[0]?.id || res?.messages?.[0]?.id || null;
+
+// Plain-language reasons for the failures we are most likely to see
+const FAILURE_HINTS = {
+  131042: 'Meta: no valid payment method on the WhatsApp account. Add one in WhatsApp Manager.',
+  131049: 'Meta held it back to protect engagement (too many marketing messages to this person).',
+  131026: 'This number cannot receive the message (not on WhatsApp, or an old WhatsApp version).',
+  131047: 'More than 24h since the donor wrote: only templates are allowed.',
+  131050: 'The person stopped marketing messages from this business.',
+  132001: 'Template not found in this language (or not approved yet).',
+  132015: 'Template is paused by Meta (low quality).',
+  132016: 'Template is disabled by Meta.',
+  130472: 'Number is part of a Meta experiment and did not get marketing messages.',
+  131056: 'Too many messages to the same number too fast.'
+};
+const failureText = (err = {}) => {
+  const code = Number(err.code);
+  return `${code || ''} ${FAILURE_HINTS[code] || err.error_data?.details || err.title || err.message || 'Failed'}`.trim().slice(0, 300);
+};
+
 // Spreadsheet-safe CSV. Cells starting with = + - @ are prefixed so Excel never runs them as formulas.
 function toCsv(rows, columns) {
   const cell = (v) => {
@@ -290,6 +313,11 @@ function createDashboard({
       sent_at TIMESTAMP DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS broadcast_recipients_bid_idx ON broadcast_recipients (broadcast_id);
+    ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS wa_message_id TEXT;
+    ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS delivery TEXT;
+    ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS delivery_error TEXT;
+    ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS delivery_at TIMESTAMP;
+    CREATE INDEX IF NOT EXISTS broadcast_recipients_wamid_idx ON broadcast_recipients (wa_message_id);
     CREATE TABLE IF NOT EXISTS admin_log (
       id SERIAL PRIMARY KEY,
       action TEXT NOT NULL,
@@ -787,14 +815,15 @@ function createDashboard({
     let sent = 0, failed = 0;
     for (let i = 0; i < recipients.length; i++) {
       const r = recipients[i];
-      let status = 'sent', error = null;
+      let status = 'sent', error = null, waId = null;
       try {
-        await sendTemplateRaw(r.phone, tpl.name, tpl.language, templateComponents(tpl, {
+        const res = await sendTemplateRaw(r.phone, tpl.name, tpl.language, templateComponents(tpl, {
           headerText: personalise(b.header_text, r.name, r.fullName),
           headerImageId: b.image?.media_id || null,
           body: b.body.map(v => personalise(v, r.name, r.fullName)),
           buttonParams: b.button_params || {}
         }));
+        waId = messageIdOf(res);
         sent++;
       } catch (err) {
         status = 'failed';
@@ -802,8 +831,8 @@ function createDashboard({
         failed++;
       }
       await pool.query(
-        `INSERT INTO broadcast_recipients (broadcast_id, donor_id, phone, channel, status, error) VALUES ($1, $2, $3, $4, $5, $6)`,
-        [id, r.donor_id, r.phone, `template:${tpl.name}`, status, error]
+        `INSERT INTO broadcast_recipients (broadcast_id, donor_id, phone, channel, status, error, wa_message_id, delivery) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [id, r.donor_id, r.phone, `template:${tpl.name}`, status, error, waId, status === 'sent' ? 'sent' : 'failed']
       ).catch(err => console.error('Template log error:', err.message));
       if (i < recipients.length - 1 && delayMs > 0) await sleep(delayMs);
     }
@@ -965,11 +994,14 @@ function createDashboard({
       const channel = imageId ? `image_${payload.channel}`.replace('image_text', 'image') : payload.channel; // text | template | image | image_template
       let status = 'sent';
       let error = null;
+      let waId = null;
       try {
-        if (channel === 'text') await sendMessage(d.phone, payload.text);
-        else if (channel === 'template') await sendTemplate(d.phone, BROADCAST_TEMPLATE, payload.params); // URL buttons are static: no params
-        else if (channel === 'image') await sendImage(d.phone, imageId, payload.text);
-        else await sendImageTemplate(d.phone, BROADCAST_IMAGE_TEMPLATE, imageId, payload.params);
+        let res;
+        if (channel === 'text') res = await sendMessage(d.phone, payload.text);
+        else if (channel === 'template') res = await sendTemplate(d.phone, BROADCAST_TEMPLATE, payload.params); // URL buttons are static: no params
+        else if (channel === 'image') res = await sendImage(d.phone, imageId, payload.text);
+        else res = await sendImageTemplate(d.phone, BROADCAST_IMAGE_TEMPLATE, imageId, payload.params);
+        waId = messageIdOf(res);
         sent++;
         if (payload.channel === 'text') viaText++; else viaTemplate++;
       } catch (err) {
@@ -978,8 +1010,8 @@ function createDashboard({
         failed++;
       }
       await pool.query(
-        `INSERT INTO broadcast_recipients (broadcast_id, donor_id, phone, channel, status, error) VALUES ($1, $2, $3, $4, $5, $6)`,
-        [id, d.id, d.phone, channel, status, error]
+        `INSERT INTO broadcast_recipients (broadcast_id, donor_id, phone, channel, status, error, wa_message_id, delivery) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [id, d.id, d.phone, channel, status, error, waId, status === 'sent' ? 'sent' : 'failed']
       ).catch(err => console.error('Broadcast log error:', err.message));
       if ((i + 1) % 20 === 0) {
         await pool.query(`UPDATE broadcasts SET sent = $2, failed = $3 WHERE id = $1`, [id, sent, failed]).catch(() => {});
@@ -1033,9 +1065,15 @@ function createDashboard({
   router.get('/api/broadcasts', api(async (req, res) => {
     const result = await pool.query(
       `SELECT b.id, b.message, b.audience, b.status, b.total, b.created_at, b.finished_at, b.via_text, b.via_template, b.image_name,
-         COALESCE(c.sent, 0) AS sent, COALESCE(c.failed, 0) AS failed
+         COALESCE(c.sent, 0) AS sent, COALESCE(c.failed, 0) AS failed, COALESCE(c.delivered, 0) AS delivered,
+         COALESCE(c.read, 0) AS read, COALESCE(c.undelivered, 0) AS undelivered, COALESCE(c.tracked, 0) AS tracked, c.sample_error
        FROM broadcasts b LEFT JOIN (
-         SELECT broadcast_id, COUNT(*) FILTER (WHERE status = 'sent') AS sent, COUNT(*) FILTER (WHERE status = 'failed') AS failed
+         SELECT broadcast_id, COUNT(*) FILTER (WHERE status = 'sent') AS sent, COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+           COUNT(*) FILTER (WHERE delivery IN ('delivered', 'read')) AS delivered,
+           COUNT(*) FILTER (WHERE delivery = 'read') AS read,
+           COUNT(*) FILTER (WHERE delivery = 'failed' AND status = 'sent') AS undelivered,
+           COUNT(*) FILTER (WHERE wa_message_id IS NOT NULL) AS tracked,
+           MIN(delivery_error) FILTER (WHERE delivery = 'failed' AND status = 'sent') AS sample_error
          FROM broadcast_recipients GROUP BY 1
        ) c ON c.broadcast_id = b.id
        ORDER BY b.id DESC LIMIT 50`
@@ -1048,7 +1086,7 @@ function createDashboard({
     const [b, recipients] = await Promise.all([
       pool.query(`SELECT * FROM broadcasts WHERE id = $1`, [id]),
       pool.query(
-        `SELECT br.donor_id, d.name, br.phone, br.channel, br.status, br.error, br.sent_at
+        `SELECT br.donor_id, d.name, br.phone, br.channel, br.status, br.error, br.sent_at, br.delivery, br.delivery_error, br.delivery_at
          FROM broadcast_recipients br LEFT JOIN donors d ON d.id = br.donor_id
          WHERE br.broadcast_id = $1 ORDER BY br.id`,
         [id]
@@ -1057,6 +1095,27 @@ function createDashboard({
     if (!b.rows.length) return res.status(404).json({ error: 'Broadcast not found.' });
     res.json({ broadcast: b.rows[0], recipients: showPhones(req, recipients.rows) });
   }));
+
+  // Meta's delivery reports. Only moves forward (sent -> delivered -> read); failed always wins.
+  async function recordStatuses(statuses = []) {
+    await schemaReady;
+    for (const st of statuses) {
+      if (!st?.id || !st.status) continue;
+      if (st.status === 'failed') {
+        await pool.query(
+          `UPDATE broadcast_recipients SET delivery = 'failed', delivery_error = $2, delivery_at = NOW() WHERE wa_message_id = $1`,
+          [st.id, failureText(st.errors?.[0])]
+        );
+      } else if (DELIVERY_RANK[st.status]) {
+        await pool.query(
+          `UPDATE broadcast_recipients SET delivery = $2, delivery_at = NOW()
+           WHERE wa_message_id = $1 AND COALESCE(delivery, '') <> 'failed'
+             AND COALESCE(CASE delivery WHEN 'sent' THEN 1 WHEN 'delivered' THEN 2 WHEN 'read' THEN 3 END, 0) < $3`,
+          [st.id, st.status, DELIVERY_RANK[st.status]]
+        );
+      }
+    }
+  }
 
   // Donor replied STOP (text or the template's "Stop updates" button)
   async function handleOptOut(phone) {
@@ -1085,6 +1144,7 @@ function createDashboard({
     router,
     handleOptOut,
     handleOptIn,
+    recordStatuses,
     schemaReady,
     get running() { return running; }
   };
@@ -1096,6 +1156,6 @@ const isStartText = (text) => /^start$/i.test(String(text || '').trim());
 module.exports = {
   createDashboard, toCsv, maskPhone, sessionToken, validSessionToken, parseCookies, withinWindow, broadcastPayload,
   audienceFilter, describeAudience, requiredTemplates, templateStatusRows, isStopText, isStartText,
-  detectImageType, imageMessageBody, imageTemplateBody, describeTemplate, templateComponents, renderTemplate, countVars, personalise,
+  failureText, messageIdOf, detectImageType, imageMessageBody, imageTemplateBody, describeTemplate, templateComponents, renderTemplate, countVars, personalise,
   STOP_PAYLOAD, MAX_BROADCAST_LENGTH, BROADCAST_IMAGE_TEMPLATE, JOIN_LINK, SITE_LINK
 };

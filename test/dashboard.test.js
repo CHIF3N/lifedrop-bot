@@ -5,7 +5,7 @@ const path = require('path');
 const express = require('express');
 const axios = require('axios');
 const {
-  createDashboard, toCsv, detectImageType, imageMessageBody, imageTemplateBody, describeTemplate, templateComponents, renderTemplate, personalise, maskPhone, sessionToken, validSessionToken, parseCookies, broadcastPayload,
+  createDashboard, toCsv, failureText, detectImageType, imageMessageBody, imageTemplateBody, describeTemplate, templateComponents, renderTemplate, personalise, maskPhone, sessionToken, validSessionToken, parseCookies, broadcastPayload,
   audienceFilter, requiredTemplates, templateStatusRows, isStopText, isStartText, STOP_PAYLOAD, JOIN_LINK, SITE_LINK
 } = require('../dashboard');
 const { createTestPool } = require('./helpers/pglite-pool');
@@ -101,10 +101,12 @@ async function setup({ sendFails = [], allowSend = true, stubImageSenders = true
   const sendMessage = async (to, text) => {
     if (sendFails.includes(to)) throw Object.assign(new Error('fail'), { response: { data: { error: { message: 'Invalid number' } } } });
     sent.push({ to, type: 'text', text });
+    return { data: { messages: [{ id: `wamid.${to}.${sent.length}` }] } };
   };
   const sendTemplate = async (to, name, params, buttons) => {
     if (sendFails.includes(to)) throw Object.assign(new Error('fail'), { response: { data: { error: { message: 'Template not approved' } } } });
     sent.push({ to, type: 'template', name, params, buttons });
+    return { data: { messages: [{ id: `wamid.${to}.${sent.length}` }] } };
   };
   const sendImage = async (to, mediaId, caption) => {
     if (sendFails.includes(to)) throw new Error('fail');
@@ -672,5 +674,37 @@ test('local mode refuses template sends, donor messages and new requests', async
     assert.strictEqual((await t.call('POST', '/api/donors/1/message', { text: 'Hi' })).status, 403);
     assert.strictEqual((await t.call('POST', '/api/requests', { confirm: true })).status, 403);
     assert.strictEqual(t.sent.length + t.created.length, 0);
+  } finally { await t.close(); }
+});
+
+// ---------- Delivery reports ----------
+test('Meta failure codes become plain-language reasons', () => {
+  assert.match(failureText({ code: 131042, title: 'Business eligibility payment issue' }), /^131042 Meta: no valid payment method/);
+  assert.strictEqual(failureText({ code: 999, title: 'Something odd' }), '999 Something odd');
+  assert.strictEqual(failureText(undefined), 'Failed');
+});
+
+test('delivery reports from the webhook update each broadcast recipient', async () => {
+  const t = await setup();
+  try {
+    await t.login();
+    const started = await t.call('POST', '/api/broadcasts', { message: 'Tip', audience: { type: 'blood_type', value: 'O+' }, confirm: true, expected_count: 2 });
+    await t.dashboard.running;
+    const ids = (await t.pool.query(`SELECT wa_message_id, delivery FROM broadcast_recipients ORDER BY id`)).rows;
+    assert.ok(ids.every(r => r.wa_message_id && r.delivery === 'sent'));
+    const [a, b] = ids.map(r => r.wa_message_id);
+
+    await t.dashboard.recordStatuses([
+      { id: a, status: 'read' },
+      { id: a, status: 'delivered' }, // late, must not move it back
+      { id: b, status: 'failed', errors: [{ code: 131042, title: 'Business eligibility payment issue' }] },
+      { id: 'wamid.unknown', status: 'delivered' } // a normal bot message: ignored
+    ]);
+    const list = (await t.call('GET', '/api/broadcasts')).body.rows[0];
+    assert.deepStrictEqual([list.sent, list.delivered, list.read, list.undelivered, list.tracked], ['2', '1', '1', '1', '2']);
+    assert.match(list.sample_error, /^131042/);
+    const detail = (await t.call('GET', `/api/broadcasts/${started.body.id}`)).body.recipients;
+    assert.deepStrictEqual(detail.map(r => r.delivery), ['read', 'failed']);
+    assert.match(detail[1].delivery_error, /payment method/);
   } finally { await t.close(); }
 });

@@ -27,7 +27,7 @@ axios.post = async (url, body) => {
   }
   const what = body?.type === 'template' ? `template ${body.template.name}` : body?.type;
   console.log(`📤 [fake WhatsApp] to ${body?.to}: ${what}${body?.text ? ` | ${body.text.body.slice(0, 60)}...` : ''}`);
-  return { data: { messages: [{ id: 'wamid.DEV' }] } };
+  return { data: { messages: [{ id: `wamid.DEV.${body?.to}` }] } };
 };
 axios.get = async (url) => {
   if (!String(url).includes('/message_templates')) throw new Error(`Blocked outbound call in dev mode: ${url}`);
